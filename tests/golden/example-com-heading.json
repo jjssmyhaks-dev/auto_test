@@ -1,0 +1,7 @@
+{
+  "id": "example-com-heading",
+  "objective": "open https://example.com and assert the heading contains Example",
+  "env": "https://example.com",
+  "status": "placeholder",
+  "notes": "Live smoke requires network + ANTHROPIC_API_KEY or OPENAI_API_KEY. CI unit tests do not call an LLM."
+}

@@ -1,0 +1,22 @@
+{
+  "name": "@veriflow/mcp",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "start": "node ./dist/index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "@veriflow/harness": "workspace:*",
+    "@veriflow/schema": "workspace:*",
+    "@veriflow/store": "workspace:*",
+    "hono": "^4.6.14",
+    "@hono/node-server": "^1.13.7"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.2"
+  }
+}

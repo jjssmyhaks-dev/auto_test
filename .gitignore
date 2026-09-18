@@ -1,0 +1,16 @@
+node_modules
+dist
+.next
+out
+*.log
+.env
+.env.*
+!.env.example
+.DS_Store
+coverage
+*.tsbuildinfo
+.turbo
+playwright-report
+test-results
+.veriflow-data
+.freebuff/

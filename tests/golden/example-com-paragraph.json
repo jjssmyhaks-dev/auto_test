@@ -1,0 +1,6 @@
+{
+  "id": "example-com-paragraph",
+  "objective": "open https://example.com and assert the page text contains domain",
+  "env": "https://example.com",
+  "status": "placeholder"
+}

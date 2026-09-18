@@ -1,0 +1,30 @@
+{
+  "name": "@veriflow/harness",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@veriflow/evidence": "workspace:*",
+    "@veriflow/llm": "workspace:*",
+    "@veriflow/schema": "workspace:*",
+    "@veriflow/store": "workspace:*",
+    "@veriflow/telemetry": "workspace:*",
+    "@veriflow/vault": "workspace:*",
+    "playwright": "^1.49.1"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.2"
+  }
+}

@@ -1,0 +1,44 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: veriflow
+      POSTGRES_PASSWORD: veriflow
+      POSTGRES_DB: veriflow
+    ports:
+      - "5432:5432"
+    volumes:
+      - veriflow_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U veriflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: veriflow
+      MINIO_ROOT_PASSWORD: veriflowsecret
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - veriflow_minio:/data
+
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      sleep 3;
+      mc alias set local http://minio:9000 veriflow veriflowsecret;
+      mc mb -p local/veriflow || true;
+      exit 0;
+      "
+
+volumes:
+  veriflow_pg:
+  veriflow_minio:

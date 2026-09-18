@@ -1,0 +1,25 @@
+{
+  "name": "@veriflow/cli",
+  "version": "0.1.0",
+  "type": "module",
+  "bin": {
+    "veriflow": "./dist/index.js"
+  },
+  "main": "./dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "start": "node ./dist/index.js"
+  },
+  "dependencies": {
+    "@veriflow/harness": "workspace:*",
+    "@veriflow/schema": "workspace:*",
+    "@veriflow/store": "workspace:*",
+    "@veriflow/telemetry": "workspace:*",
+    "@veriflow/vault": "workspace:*",
+    "commander": "^12.1.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.2"
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "veriflow": {
+      "command": "pnpm",
+      "args": ["--filter", "@veriflow/mcp", "start", "--", "--stdio"],
+      "env": {
+        "VERIFLOW_API_KEY": "vf_replace_me",
+        "VERIFLOW_API_URL": "http://127.0.0.1:8787"
+      }
+    }
+  }
+}
