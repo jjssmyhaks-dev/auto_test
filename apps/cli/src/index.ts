@@ -1,20 +1,24 @@
 #!/usr/bin/env node
-import { readFileSync, mkdirSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { Command } from "commander";
 import {
   actionsFromEvents,
   CloudClient,
+  computeReliabilityMetrics,
   exportPlaywrightTest,
   importPlaywrightTest,
+  replayLive,
   runAgentTest,
   runHarness,
+  runReliability,
   syncRunIfConfigured,
 } from "@veriflow/harness";
 import {
   computeLocalFlowMetrics,
   loadConfig,
   listFlows,
+  listRunIds,
   readEvents,
   readSpans,
   runPaths,
@@ -22,7 +26,7 @@ import {
   saveFlow,
   veriflowHome,
 } from "@veriflow/store";
-import { saveCredentials } from "@veriflow/vault";
+import { Vault, saveCredentials } from "@veriflow/vault";
 import { spansToOtlp } from "@veriflow/telemetry";
 
 const program = new Command()
@@ -57,6 +61,7 @@ program
         dryRun: Boolean(opts.dryRun),
         captureDevtools: Boolean(opts.devtools),
         otlp: Boolean(opts.otlp),
+        progress: (line) => console.error(line),
       });
       if (!opts.agent) {
         console.log(`run ${result.runId} ${result.status}`);
@@ -77,19 +82,45 @@ program
 
 program
   .command("replay")
-  .description("Playback a run from the local event log (no browser, no LLM)")
+  .description("Playback a run from the local event log (no browser, no LLM); --live re-executes against the site")
   .argument("<runId>", "Run id under ~/.veriflow/runs")
-  .action((runId: string) => {
+  .option("--live", "Deterministically re-execute the recorded actions in a real browser (no LLM)", false)
+  .option("--headless", "Use a headless browser for --live (default true; pass --no-headless to watch)", true)
+  .action(async (runId: string, opts: { live?: boolean; headless?: boolean }) => {
     try {
       const events = readEvents(runId);
       const rp = runPaths(runId);
-      console.log(`# Veriflow replay ${runId}`);
-      console.log(`# events ${rp.events}`);
-      for (const event of events) {
-        console.log(
-          `${event.ts} ${event.type} step=${event.stepIndex ?? "-"} ${JSON.stringify(event.payload)}`,
-        );
+      if (!opts.live) {
+        console.log(`# Veriflow replay ${runId}`);
+        console.log(`# events ${rp.events}`);
+        for (const event of events) {
+          console.log(
+            `${event.ts} ${event.type} step=${event.stepIndex ?? "-"} ${JSON.stringify(event.payload)}`,
+          );
+        }
+        return;
       }
+      const vault = new Vault();
+      const secrets = vault.secretValues();
+      const result = await replayLive({
+        runId,
+        events,
+        headless: opts.headless !== false,
+        resolveSecret: (action) => {
+          if (action.type !== "fill") return undefined;
+          if (action.vaultKey) return vault.get(action.vaultKey);
+          return action.secret ? undefined : action.value;
+        },
+      });
+      for (const step of result.steps) {
+        const flag = step.skipped ? "skip" : step.ok ? "ok" : "FAIL";
+        console.log(`${flag.padEnd(4)} step ${step.index} ${step.action.type} — ${step.detail}`);
+      }
+      const passed = result.failed === 0 && result.executed > 0;
+      console.log(
+        `live replay ${runId}: ${passed ? "PASS" : "FAIL"} (executed ${result.executed}, ok ${result.passed}, failed ${result.failed}, skipped ${result.skipped})`,
+      );
+      process.exitCode = passed ? 0 : 1;
     } catch (err) {
       console.error(err instanceof Error ? err.message : err);
       process.exitCode = 1;
@@ -172,9 +203,10 @@ program
 program
   .command("export")
   .description("Export a saved flow/run action sequence")
+  .option("--out <path>", "Write the Playwright source to a file instead of stdout")
   .option("--format <fmt>", "playwright", "playwright")
   .argument("[runId]")
-  .action((runId: string | undefined, opts: { format?: string }) => {
+  .action((runId: string | undefined, opts: { format?: string; out?: string }) => {
     try {
       if (opts.format !== "playwright") {
         console.error("only --format playwright is supported");
@@ -194,7 +226,12 @@ program
         envUrl: start?.payload.envUrl as string | undefined,
         actions: actionsFromEvents(events),
       });
-      console.log(src);
+      if (opts.out) {
+        writeFileSync(opts.out, src, "utf8");
+        console.log(`wrote ${opts.out}`);
+      } else {
+        console.log(src);
+      }
     } catch (err) {
       console.error(err instanceof Error ? err.message : err);
       process.exitCode = 1;
@@ -256,6 +293,53 @@ program
   });
 
 program
+  .command("secrets")
+  .description("Manage the local encrypted secrets vault (AES-256-GCM)")
+  .argument("[action]", "list | set | delete")
+  .option("--key <name>", "Secret key name (e.g. staging_password)")
+  .option("--value <value>", "Secret value (prefer env: VERIFLOW_SECRET_VALUE)")
+  .action((action: string | undefined, opts: { key?: string; value?: string }) => {
+    const vault = new Vault();
+    if (!action || action === "list") {
+      const keys = vault.keys();
+      if (!keys.length) {
+        console.log("(empty vault)");
+        return;
+      }
+      for (const k of keys) console.log(k);
+      return;
+    }
+    if (action === "set") {
+      if (!opts.key) {
+        console.error("--key required");
+        process.exitCode = 1;
+        return;
+      }
+      const value = opts.value ?? process.env.VERIFLOW_SECRET_VALUE;
+      if (!value) {
+        console.error("--value or VERIFLOW_SECRET_VALUE required");
+        process.exitCode = 1;
+        return;
+      }
+      vault.set(opts.key, value);
+      console.log(`secret ${opts.key} stored (encrypted)`);
+      return;
+    }
+    if (action === "delete") {
+      if (!opts.key) {
+        console.error("--key required");
+        process.exitCode = 1;
+        return;
+      }
+      vault.delete(opts.key);
+      console.log(`secret ${opts.key} deleted`);
+      return;
+    }
+    console.error("secrets [list|set|delete]");
+    process.exitCode = 1;
+  });
+
+program
   .command("trace")
   .description("Print step timeline + spans for a local (or synced) run")
   .argument("<runId>")
@@ -287,17 +371,28 @@ program
   .action(async (flowId: string) => {
     const flows = listFlows().filter((f) => f.id === flowId || f.name === flowId);
     const local = computeLocalFlowMetrics(flowId);
+    const reliability = computeReliabilityMetrics(
+      listRunIds()
+        .map((id) => {
+          try {
+            return runReliability(id, readEvents(id));
+          } catch {
+            return undefined;
+          }
+        })
+        .filter((r): r is NonNullable<typeof r> => Boolean(r)),
+    );
     const client = CloudClient.fromEnvOrStore();
     if (client) {
       try {
         const cloud = await client.metrics(flowId);
-        console.log(JSON.stringify({ cloud, local, matchedFlows: flows }, null, 2));
+        console.log(JSON.stringify({ cloud, local, reliability, matchedFlows: flows }, null, 2));
         return;
       } catch (err) {
         console.error(err instanceof Error ? err.message : err);
       }
     }
-    console.log(JSON.stringify(local, null, 2));
+    console.log(JSON.stringify({ local, reliability }, null, 2));
   });
 
 const budget = program.command("budget").description("Local budget caps");

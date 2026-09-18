@@ -30,6 +30,8 @@ export interface RunOptions {
   captureDevtools?: boolean;
   otlp?: boolean;
   sync?: boolean;
+  /** Optional live progress hook (interactive TUI-lite). Not called in agent mode. */
+  progress?: (line: string) => void;
 }
 
 export interface RunResult {
@@ -79,7 +81,7 @@ export async function runHarness(opts: RunOptions): Promise<RunResult> {
   const rp = ensureRunDir(runId, home);
   const vault = new Vault(home);
   const secrets = vault.secretValues();
-  const logger = new RunLogger(runId, createAgentSink(Boolean(opts.agent)));
+  const logger = new RunLogger(runId, createAgentSink(Boolean(opts.agent)), true, home);
   const spans = new SpanRecorder();
   const llm = opts.provider ?? createProvider(config);
   const started = Date.now();
@@ -91,6 +93,9 @@ export async function runHarness(opts: RunOptions): Promise<RunResult> {
   let nodes: A11yNode[] = [];
   let stepIndex = 0;
   let capture: DevtoolsCapture = emptyCapture();
+  const progress = (line: string) => {
+    if (!opts.agent) opts.progress?.(line);
+  };
 
   logger.emit("run_start", {
     objective: opts.objective,
@@ -99,6 +104,7 @@ export async function runHarness(opts: RunOptions): Promise<RunResult> {
     profile: opts.profile,
     record: opts.record !== false,
   });
+  progress(`▸ objective: ${opts.objective}`);
 
   let browser: Browser | undefined;
   let page: Page | undefined;
@@ -133,10 +139,12 @@ export async function runHarness(opts: RunOptions): Promise<RunResult> {
       nodes = observed.a11y.nodes;
       const shotPath = join(rp.screenshots, `step-${stepIndex}.png`);
       writeFileSync(shotPath, observed.screenshotPng);
+      // URLs can carry filled values (GET forms) — redact vault secrets there too.
+      const safeUrl = redactSecrets(observed.url, secrets);
       logger.emit(
         "observe",
         {
-          url: observed.url,
+          url: safeUrl,
           a11y: redactSecrets(observed.a11y.tree, secrets),
           screenshot: `screenshots/step-${stepIndex}.png`,
         },
@@ -144,6 +152,7 @@ export async function runHarness(opts: RunOptions): Promise<RunResult> {
         observeSpan.span.id,
       );
       observeSpan.end(true);
+      progress(`▸ step ${stepIndex} observe ${safeUrl}`);
 
       const decideSpan = spans.start({ runId, kind: "DECIDE" });
       const decideInput = {
@@ -177,6 +186,7 @@ export async function runHarness(opts: RunOptions): Promise<RunResult> {
       const action = parsed.data;
       decideSpan.end(true, undefined, { actionType: action.type });
       logger.emit("decide", { action: redactDeep(action, secrets) }, stepIndex, decideSpan.span.id);
+      progress(`▸ step ${stepIndex} decide ${action.type}`);
 
       const guardSpan = spans.start({ runId, kind: "GUARD" });
       const verdict = evaluateGuards({
@@ -199,6 +209,7 @@ export async function runHarness(opts: RunOptions): Promise<RunResult> {
         guardSpan.end(false, verdict.code);
         status = "aborted";
         error = verdict.message;
+        progress(`■ guard ${verdict.code}: ${verdict.message}`);
         break;
       }
       guardSpan.end(true);
@@ -285,6 +296,7 @@ export async function runHarness(opts: RunOptions): Promise<RunResult> {
   }
 
   logger.emit("run_end", { status, error, steps: stepIndex, costUsd, tokens });
+  progress(`■ run ${status}${error ? ` — ${error}` : ""} (${stepIndex} steps, $${costUsd.toFixed(4)})`);
   persistSpans(runId, spans.spans, home);
   if (captureOn) persistCapture(runId, capture, home);
   if (otlpOn) {

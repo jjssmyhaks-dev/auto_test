@@ -18,3 +18,7 @@ export { CloudClient, CloudApiError, syncRunIfConfigured } from "./cloud.js";
 export { attachDevtoolsCapture, assertConsole, assertNetwork, emptyCapture } from "./devtools.js";
 export type { DevtoolsCapture } from "./devtools.js";
 export { observePage, performAction, verifyAction } from "./act.js";
+export { runReliability, computeReliabilityMetrics } from "./metrics.js";
+export type { RunReliability, ReliabilityMetrics } from "./metrics.js";
+export { replayLive } from "./replay-live.js";
+export type { LiveReplayResult, LiveReplayStep } from "./replay-live.js";

@@ -30,12 +30,12 @@ export function createMcpServer(): Server {
   return server;
 }
 
+/**
+ * One StreamableHTTP transport + server instance per MCP session.
+ * Sharing a single transport across HTTP clients breaks concurrent sessions.
+ */
 async function listenHttp(port: number): Promise<void> {
-  const server = createMcpServer();
-  const transport = new StreamableHTTPServerTransport({
-    sessionIdGenerator: () => randomUUID(),
-  });
-  await server.connect(transport);
+  const sessions = new Map<string, { server: Server; transport: StreamableHTTPServerTransport }>();
 
   const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse) => {
     if (req.url === "/health") {
@@ -43,6 +43,34 @@ async function listenHttp(port: number): Promise<void> {
       res.end(JSON.stringify({ ok: true, service: "veriflow-mcp", tools: TOOLS.map((t) => t.name) }));
       return;
     }
+
+    const sessionIdHeader = req.headers["mcp-session-id"];
+    const existingId = typeof sessionIdHeader === "string" ? sessionIdHeader : undefined;
+
+    if (existingId) {
+      const session = sessions.get(existingId);
+      if (!session) {
+        res.writeHead(404, { "content-type": "application/json" });
+        res.end(JSON.stringify({ jsonrpc: "2.0", error: { code: -32001, message: "Session not found" }, id: null }));
+        return;
+      }
+      await session.transport.handleRequest(req, res);
+      return;
+    }
+
+    // New session (initialize request): stand up a dedicated transport.
+    const server = createMcpServer();
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: () => randomUUID(),
+      onsessioninitialized: (id) => {
+        sessions.set(id, { server, transport });
+      },
+    });
+    transport.onclose = () => {
+      const id = transport.sessionId;
+      if (id) sessions.delete(id);
+    };
+    await server.connect(transport);
     await transport.handleRequest(req, res);
   });
 

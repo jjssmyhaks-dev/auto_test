@@ -59,8 +59,18 @@ export function createApp(deps?: Partial<AppDeps>) {
         "/health": { get: {} },
         "/v1/auth/signup": { post: {} },
         "/v1/auth/login": { post: {} },
+        "/v1/me": { get: {} },
+        "/v1/projects": { get: {}, post: {} },
+        "/v1/projects/{id}/keys": { get: {}, post: {} },
         "/v1/runs": { get: {}, post: {} },
+        "/v1/runs/{id}": { get: {} },
+        "/v1/runs/{id}/trace": { get: {} },
+        "/v1/runs/{id}/blobs/{path}": { get: {} },
+        "/v1/flows": { get: {}, post: {} },
+        "/v1/usage": { get: {} },
         "/v1/billing/upgrade": { post: {} },
+        "/v1/alerts": { get: {} },
+        "/v1/metrics/{flowId}": { get: {} },
       },
     }),
   );
@@ -402,10 +412,18 @@ export function createApp(deps?: Partial<AppDeps>) {
     const project = await resolveProject(ctx);
     const runs = project ? await store.listRuns(project.id) : [];
     const alerts = computeAlerts(runs);
-    if (process.env.VERIFLOW_ALERT_WEBHOOK && alerts.length) {
-      console.log("alert webhook stub", process.env.VERIFLOW_ALERT_WEBHOOK, alerts);
+    const webhook = process.env.VERIFLOW_ALERT_WEBHOOK;
+    let delivery = "log_only";
+    if (webhook && alerts.length) {
+      delivery = "webhook";
+      // Fire-and-forget POST; a slow webhook must not delay the API response.
+      void fetch(webhook, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ projectId: project?.id, alerts, at: new Date().toISOString() }),
+      }).catch((err) => console.error("alert webhook failed:", err instanceof Error ? err.message : err));
     }
-    return c.json({ alerts, delivery: process.env.VERIFLOW_ALERT_WEBHOOK ? "webhook_stub_logged" : "log_only" });
+    return c.json({ alerts, delivery });
   });
 
   app.get("/v1/metrics/:flowId", async (c) => {

@@ -55,6 +55,7 @@ export class RunLogger {
     private readonly runId: string,
     private readonly agentSink: NdjsonSink | undefined,
     private readonly persist = true,
+    private readonly home?: string,
   ) {}
 
   emit(type: RunEventType, payload: Record<string, unknown> = {}, stepIndex?: number, spanId?: string): RunEvent {
@@ -67,7 +68,7 @@ export class RunLogger {
       payload,
     };
     if (this.persist) {
-      appendEvent(this.runId, event);
+      appendEvent(this.runId, event, this.home);
     }
     this.agentSink?.write({ ...event });
     return event;

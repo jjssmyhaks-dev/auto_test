@@ -108,15 +108,17 @@ Tools: `run_flow`, `get_run`, `export_playwright`, `list_flows`, `list_runs`, `g
 | Command | Behavior |
 | --- | --- |
 | `veriflow run "<objective>" [--headless] [--env] [--profile] [--devtools] [--otlp] [--sync] [--agent] [--yes-i-mean-it] [--dry-run]` | Harness |
-| `veriflow replay <run-id>` | Local event log |
+| `veriflow replay <run-id>` | Local event log playback (no browser, no LLM) |
+| `veriflow replay <run-id> --live` | Deterministic re-execution of the recorded actions in a real browser — regression-check a passing flow without re-paying for LLM decisions |
 | `veriflow login --email --password [--signup] [--api-url]` | Encrypted credentials |
 | `veriflow profiles [list\|set --name --env]` | Named env URLs |
-| `veriflow export --format playwright <run-id>` | Playwright test from actions |
+| `veriflow export --format playwright <run-id> [--out <path>]` | Playwright test from actions (stdout or `--out` file) |
 | `veriflow import --from playwright <path>` | Best-effort flow (goto/click/fill/expect only) |
+| `veriflow secrets [list\|set --key --value\|delete --key]` | Local AES-256-GCM secrets vault (values redacted pre-LLM and pre-storage) |
 | `veriflow agent-test --endpoint <url> --scenarios N` | Chat-only eval |
 | `veriflow redteam` | Reserved, not a security suite |
 | `veriflow trace <run-id>` | Timeline + OTLP-shaped JSON |
-| `veriflow metrics <flow-id>` | Pass rate / cost (local event logs; cloud if logged in) |
+| `veriflow metrics <flow-id>` | Pass rate / cost + reliability rollup (self-heal rate, human-intervention rate, step p50/p95) over local event logs; cloud if logged in |
 | `veriflow budget get` | Print local caps |
 | `veriflow budget set --run-cap <n> [--cost-cap <usd>]` | Local step/cost cap |
 
@@ -140,6 +142,16 @@ pnpm typecheck
 ```
 
 CI unit tests do not need provider keys.
+
+### Golden-flow regression suite
+
+`tests/golden/` runs the **real harness loop** (OBSERVE → DECIDE → GUARD → ACT → VERIFY, real Chromium) against a deterministic local test site with a scripted LLM provider — no network, no API keys, no LLM cost. It covers the canonical flows (login + heading assert, multi-step cart), evidence-pack creation, per-step screenshots, and the secret-redaction guarantee (typed secrets never appear in stored events, even via GET-form URLs or password-field a11y snapshots). Run it on every harness change and treat pass rate as the internal reliability metric.
+
+Run a single golden file explicitly:
+
+```bash
+npx vitest run tests/golden/harness.golden.test.ts
+```
 
 ## Monorepo
 

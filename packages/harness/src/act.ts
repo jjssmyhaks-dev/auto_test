@@ -58,11 +58,13 @@ export async function observePage(page: Page): Promise<{
       const role =
         el.getAttribute("role") ||
         (el.tagName === "A" ? "link" : el.tagName.toLowerCase());
+      // Never expose typed values for password fields — only labels/placeholders.
+      const safeValue = el instanceof HTMLInputElement && el.type === "password" ? "" : (el as HTMLInputElement).value;
       const name =
         (el.getAttribute("aria-label") ||
           (el as HTMLInputElement).placeholder ||
           el.textContent ||
-          (el as HTMLInputElement).value ||
+          safeValue ||
           "")
           .replace(/\s+/g, " ")
           .trim()
