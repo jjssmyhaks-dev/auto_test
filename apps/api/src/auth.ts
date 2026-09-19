@@ -135,6 +135,19 @@ export interface HumanPauseRow {
   expiresAt: string;
 }
 
+/** Per-user UI progress (onboarding checklist, guided tour) so it follows
+ *  the account across devices instead of living only in localStorage. */
+export interface UserProgressRow {
+  userId: string;
+  /** Completed onboarding actions, e.g. "queue_run". */
+  onboardingDone: string[];
+  onboardingDismissed: boolean;
+  /** Guided tour: last visited step index; absent once cleanly finished. */
+  tourStep?: number;
+  tourMode?: "guided" | "interactive";
+  updatedAt: string;
+}
+
 /** Spec §4: precomputed per-flow/project metrics so the dashboard never
  *  scans raw spans on page load. Two windows: trailing 7 and 30 days. */
 export interface MetricRollupRow {

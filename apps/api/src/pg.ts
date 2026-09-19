@@ -1,6 +1,6 @@
 import pg from "pg";
 import type { BillingTier } from "@veriflow/schema";
-import { newId, type AlertRuleRow, type ApiKeyRow, type FlowRow, type HumanPauseRow, type MetricRollupRow, type ProjectRow, type RunRow, type SpanRow, type StepRow, type UsageRow, type UserRow } from "./auth.js";
+import { newId, type AlertRuleRow, type ApiKeyRow, type FlowRow, type HumanPauseRow, type MetricRollupRow, type ProjectRow, type RunRow, type SpanRow, type StepRow, type UsageRow, type UserProgressRow, type UserRow } from "./auth.js";
 import type { CloudStore } from "./store.js";
 
 const DDL = `
@@ -114,6 +114,14 @@ CREATE TABLE IF NOT EXISTS metric_rollups (
   self_heal_rate DOUBLE PRECISION NOT NULL,
   human_intervention_rate DOUBLE PRECISION NOT NULL,
   guard_abort_rate DOUBLE PRECISION NOT NULL
+);
+CREATE TABLE IF NOT EXISTS user_progress (
+  user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  onboarding_done JSONB NOT NULL DEFAULT '[]'::jsonb,
+  onboarding_dismissed BOOLEAN NOT NULL DEFAULT FALSE,
+  tour_step INT,
+  tour_mode TEXT,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 `;
 
@@ -486,6 +494,34 @@ export class PgStore implements CloudStore {
       ? await this.pool.query(`SELECT * FROM metric_rollups WHERE project_id=$1 AND flow_id=$2`, [projectId, flowId])
       : await this.pool.query(`SELECT * FROM metric_rollups WHERE project_id=$1`, [projectId]);
     return res.rows.map(mapRollup);
+  }
+
+  async getUserProgress(userId: string): Promise<UserProgressRow | undefined> {
+    const res = await this.pool.query(`SELECT * FROM user_progress WHERE user_id=$1`, [userId]);
+    const r = res.rows[0];
+    if (!r) return undefined;
+    return {
+      userId: r.user_id,
+      onboardingDone: r.onboarding_done ?? [],
+      onboardingDismissed: r.onboarding_dismissed,
+      tourStep: r.tour_step ?? undefined,
+      tourMode: r.tour_mode ?? undefined,
+      updatedAt: new Date(r.updated_at).toISOString(),
+    };
+  }
+  async saveUserProgress(row: UserProgressRow): Promise<UserProgressRow> {
+    await this.pool.query(
+      `INSERT INTO user_progress (user_id, onboarding_done, onboarding_dismissed, tour_step, tour_mode, updated_at)
+       VALUES ($1,$2::jsonb,$3,$4,$5,now())
+       ON CONFLICT (user_id) DO UPDATE SET
+         onboarding_done = EXCLUDED.onboarding_done,
+         onboarding_dismissed = EXCLUDED.onboarding_dismissed,
+         tour_step = EXCLUDED.tour_step,
+         tour_mode = EXCLUDED.tour_mode,
+         updated_at = now()`,
+      [row.userId, JSON.stringify(row.onboardingDone), row.onboardingDismissed, row.tourStep ?? null, row.tourMode ?? null],
+    );
+    return row;
   }
 
   private mapRun(r: pg.QueryResultRow): RunRow {

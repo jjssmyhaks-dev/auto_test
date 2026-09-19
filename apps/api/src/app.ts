@@ -108,6 +108,7 @@ export function createApp(deps?: Partial<AppDeps>) {
         "/v1/human-pauses/{id}": { get: {} },
         "/v1/human-pauses/{id}/resolve": { post: {} },
         "/v1/agent-tests": { post: {} },
+        "/v1/progress": { get: {}, put: {} },
         "/v1/metrics/rollups": { get: {} },
         "/v1/metrics/rollups/refresh": { post: {} },
         "/v1/metrics/{flowId}": { get: {} },
@@ -660,6 +661,57 @@ export function createApp(deps?: Partial<AppDeps>) {
     } catch (err) {
       return c.json({ error: err instanceof Error ? err.message : "agent test failed" }, 502);
     }
+  });
+
+  // Per-user UI progress (onboarding + guided tour) — follows the account
+  // across devices. GET returns the stored row; PUT upserts a merged one.
+  app.get("/v1/progress", async (c) => {
+    const { ctx, error } = await requireAuth(c);
+    if (!ctx) return error;
+    const row = await store.getUserProgress(ctx.user.id);
+    return c.json({
+      progress: row ?? {
+        userId: ctx.user.id,
+        onboardingDone: [],
+        onboardingDismissed: false,
+        updatedAt: new Date().toISOString(),
+      },
+    });
+  });
+
+  app.put("/v1/progress", async (c) => {
+    const { ctx, error } = await requireAuth(c);
+    if (!ctx) return error;
+    const body = (await c.req.json().catch(() => ({}))) as {
+      onboardingDone?: unknown;
+      onboardingDismissed?: unknown;
+      tourStep?: unknown;
+      tourMode?: unknown;
+    };
+    const existing = await store.getUserProgress(ctx.user.id);
+    const validActions = new Set(["queue_run", "scrub_trace", "create_flow", "create_alert_rule"]);
+    // Onboarding ticks are append-only and unioned server-side so concurrent
+    // devices never lose each other's progress; dismissal is sticky.
+    const incoming = Array.isArray(body.onboardingDone)
+      ? body.onboardingDone.filter((a): a is string => typeof a === "string" && validActions.has(a))
+      : [];
+    const onboardingDone = [...new Set([...(existing?.onboardingDone ?? []), ...incoming])];
+    const row = {
+      userId: ctx.user.id,
+      onboardingDone,
+      onboardingDismissed:
+        body.onboardingDismissed === true || (existing?.onboardingDismissed ?? false),
+      tourStep:
+        body.tourStep === null
+          ? undefined // explicit clear (tour finished)
+          : typeof body.tourStep === "number" && Number.isInteger(body.tourStep) && body.tourStep >= 0
+            ? body.tourStep
+            : existing?.tourStep,
+      tourMode: body.tourMode === "interactive" || body.tourMode === "guided" ? body.tourMode : existing?.tourMode,
+      updatedAt: new Date().toISOString(),
+    };
+    const saved = await store.saveUserProgress(row);
+    return c.json({ progress: saved });
   });
 
   // Spec §4: precomputed metric rollups — refresh recomputes per-flow 7/30-day

@@ -4,6 +4,7 @@ import { FormEvent, useState } from "react";
 import { api, setToken } from "@/lib/api";
 import { useRouter } from "next/navigation";
 import { AppPage } from "@/components/app-page";
+import { syncOnboardingFromAccount } from "@/lib/onboarding";
 
 export default function LoginPage() {
   const router = useRouter();
@@ -22,6 +23,9 @@ export default function LoginPage() {
         body: JSON.stringify({ email, password }),
       });
       setToken(res.token);
+      // Pull this account's onboarding/tour progress so it follows the user
+      // across devices; union with anything done locally before sign-in.
+      void syncOnboardingFromAccount();
       router.push("/runs");
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));

@@ -173,6 +173,63 @@ describe("Veriflow API", () => {
     expect(deleted.status).toBe(200);
   });
 
+  it("syncs per-user progress (onboarding + tour) across sessions", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "vf-progress-"));
+    const app = createApp({ store: new MemoryStore(), blobs: new FsBlobStore(join(dir, "blobs")) });
+    const signup = await json(app, "/v1/auth/signup", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ email: "p@example.com", password: "password1" }),
+    });
+    const auth = { authorization: `Bearer ${signup.body.token as string}`, "content-type": "application/json" };
+
+    // Empty initially.
+    const empty = await json(app, "/v1/progress", { headers: auth });
+    expect((empty.body.progress as { onboardingDone: string[] }).onboardingDone).toEqual([]);
+
+    // PUT merges and persists: onboarding actions + paused tour step.
+    const put1 = await json(app, "/v1/progress", {
+      method: "PUT",
+      headers: auth,
+      body: JSON.stringify({ onboardingDone: ["queue_run", "scrub_trace"], tourStep: 2, tourMode: "interactive" }),
+    });
+    expect(put1.status).toBe(200);
+    expect((put1.body.progress as { onboardingDone: string[] }).onboardingDone).toEqual(["queue_run", "scrub_trace"]);
+
+    // A later PUT with only onboarding fields keeps the tour step (merge).
+    const put2 = await json(app, "/v1/progress", {
+      method: "PUT",
+      headers: auth,
+      body: JSON.stringify({ onboardingDone: ["queue_run", "scrub_trace", "create_flow"] }),
+    });
+    const merged = put2.body.progress as { tourStep?: number; onboardingDone: string[] };
+    expect(merged.tourStep).toBe(2);
+    expect(merged.onboardingDone).toEqual(["queue_run", "scrub_trace", "create_flow"]);
+
+    // Union semantics: a device that only knows about queue_run doesn't erase
+    // the other ticks, invalid names are dropped, and dismissal is sticky.
+    const put3 = await json(app, "/v1/progress", {
+      method: "PUT",
+      headers: auth,
+      body: JSON.stringify({ onboardingDone: ["queue_run", "nope"], onboardingDismissed: true }),
+    });
+    const sanitized = put3.body.progress as { onboardingDone: string[]; onboardingDismissed: boolean };
+    expect(sanitized.onboardingDone).toEqual(["queue_run", "scrub_trace", "create_flow"]);
+    expect(sanitized.onboardingDismissed).toBe(true);
+
+    // Finishing the tour clears the step on the account.
+    const put4 = await json(app, "/v1/progress", {
+      method: "PUT",
+      headers: auth,
+      body: JSON.stringify({ tourStep: null }),
+    });
+    expect((put4.body.progress as { tourStep?: number }).tourStep).toBeUndefined();
+
+    // It persists across "sessions".
+    const again = await json(app, "/v1/progress", { headers: auth });
+    expect((again.body.progress as { tourStep?: number }).tourStep).toBeUndefined();
+  });
+
   it("creates, lists, and resolves a human pause (CI magic link)", async () => {
     const dir = mkdtempSync(join(tmpdir(), "vf-pause-"));
     const app = createApp({ store: new MemoryStore(), blobs: new FsBlobStore(join(dir, "blobs")) });

@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
+import { api, getToken } from "@/lib/api";
 
 export interface TourWait {
   /** Selector the action must happen inside. */
@@ -108,7 +109,18 @@ const TOUR_KEY = "veriflow_tour_done";
 const TOUR_RESUME_KEY = "veriflow_tour_step";
 const TOUR_MODE_KEY = "veriflow_tour_mode";
 
-type TourApi = { start: (opts?: { interactive?: boolean }) => void };
+type TourApi = { start: (opts?: { interactive?: boolean; step?: number }) => void };
+
+/** Push tour position to the account when signed in; fire-and-forget. */
+function pushTourRemote(step: number | null, mode: "guided" | "interactive") {
+  if (typeof window === "undefined" || !getToken()) return;
+  api("/v1/progress", {
+    method: "PUT",
+    body: JSON.stringify({ tourStep: step, tourMode: mode }),
+  }).catch(() => {
+    // Offline — local resume key remains the fallback.
+  });
+}
 
 export function TourGuide() {
   const router = useRouter();
@@ -122,31 +134,53 @@ export function TourGuide() {
   const pathname = typeof window !== "undefined" ? window.location.pathname : "/";
   const vh = typeof window !== "undefined" ? window.innerHeight : 800;
 
-  const start = useCallback((opts?: { interactive?: boolean }) => {
-    // Resume from the persisted step unless the tour was finished cleanly.
+  const start = useCallback((opts?: { interactive?: boolean; step?: number }) => {
     const saved = Number.parseInt(localStorage.getItem(TOUR_RESUME_KEY) ?? "0", 10);
-    setIndex(Number.isFinite(saved) ? Math.max(0, Math.min(TOUR_STEPS.length - 1, saved)) : 0);
+    const savedStep = Number.isFinite(saved) ? Math.max(0, Math.min(TOUR_STEPS.length - 1, saved)) : 0;
+    setIndex(Math.max(0, Math.min(TOUR_STEPS.length - 1, opts?.step ?? savedStep)));
     const savedMode = localStorage.getItem(TOUR_MODE_KEY) === "interactive";
     setInteractive(opts?.interactive ?? savedMode);
     setActed(false);
     setActive(true);
   }, []);
 
-  // Expose start to the header buttons; auto-start/resume for returning users
-  // who haven't finished the tour cleanly yet.
+  // Auto-start/resume: merge local progress with the account's (farthest step
+  // wins) so returning users — on any device — continue where they left off.
   useEffect(() => {
     (window as unknown as { __veriflowTour?: TourApi }).__veriflowTour = { start };
-    if (typeof window !== "undefined" && !localStorage.getItem(TOUR_KEY)) {
-      start();
+    let cancelled = false;
+    const localDone = typeof window !== "undefined" && !!localStorage.getItem(TOUR_KEY);
+    if (!localDone) {
+      const localStep = Number.parseInt(localStorage.getItem(TOUR_RESUME_KEY) ?? "", 10);
+      const merge = (remoteStep: number | null, remoteMode: string | null) => {
+        if (cancelled) return;
+        const base = Number.isFinite(localStep) ? localStep : 0;
+        const target = Math.max(0, Math.min(TOUR_STEPS.length - 1, Math.max(base, remoteStep ?? 0)));
+        start({ interactive: remoteMode === "interactive" ? true : undefined, step: target });
+      };
+      if (typeof window !== "undefined" && getToken()) {
+        api<{ progress: { tourStep?: number; tourMode?: string } }>("/v1/progress")
+          .then(({ progress }) => merge(progress.tourStep ?? null, progress.tourMode ?? null))
+          .catch(() => merge(null, null));
+      } else {
+        merge(null, null);
+      }
     }
+    return () => {
+      cancelled = true;
+    };
   }, [start]);
 
-  // Persist progress while the tour is open so a reload returns to this step.
+  // Persist progress while the tour is open (locally + to the account) so a
+  // reload — or another device — returns to this step.
   useEffect(() => {
-    if (active) localStorage.setItem(TOUR_RESUME_KEY, String(index));
-  }, [active, index]);
+    if (active) {
+      localStorage.setItem(TOUR_RESUME_KEY, String(index));
+      pushTourRemote(index, interactive ? "interactive" : "guided");
+    }
+  }, [active, index, interactive]);
 
-  // Persist the chosen mode.
+  // Persist the chosen mode locally.
   useEffect(() => {
     if (active) localStorage.setItem(TOUR_MODE_KEY, interactive ? "interactive" : "guided");
   }, [active, interactive]);
@@ -186,18 +220,21 @@ export function TourGuide() {
     setActive(false);
   }, []);
 
-  // Reaching the end = done: progress cleared, no more auto-starts.
+  // Reaching the end = done: progress cleared (local + account), no more
+  // auto-starts.
   const finish = useCallback(() => {
     setActive(false);
     localStorage.removeItem(TOUR_RESUME_KEY);
     localStorage.setItem(TOUR_KEY, "1");
-  }, []);
+    pushTourRemote(null, interactive ? "interactive" : "guided");
+  }, [interactive]);
 
   const restart = useCallback(() => {
     localStorage.removeItem(TOUR_RESUME_KEY);
     setIndex(0);
     setActed(false);
-  }, []);
+    pushTourRemote(0, interactive ? "interactive" : "guided");
+  }, [interactive]);
 
   const go = useCallback(
     (next: number) => {

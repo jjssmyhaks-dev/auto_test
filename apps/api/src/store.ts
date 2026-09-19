@@ -15,6 +15,7 @@ import {
   type SpanRow,
   type StepRow,
   type UsageRow,
+  type UserProgressRow,
   type UserRow,
 } from "./auth.js";
 
@@ -54,6 +55,8 @@ export interface CloudStore {
   resolveHumanPause(id: string, response: string): Promise<HumanPauseRow | undefined>;
   replaceMetricRollups(projectId: string, rollups: MetricRollupRow[]): Promise<void>;
   listMetricRollups(projectId: string, flowId?: string): Promise<MetricRollupRow[]>;
+  getUserProgress(userId: string): Promise<UserProgressRow | undefined>;
+  saveUserProgress(row: UserProgressRow): Promise<UserProgressRow>;
 }
 
 interface FileDb {
@@ -69,6 +72,7 @@ interface FileDb {
   alertRules: AlertRuleRow[];
   humanPauses: HumanPauseRow[];
   metricRollups: MetricRollupRow[];
+  userProgress: UserProgressRow[];
 }
 
 function emptyDb(): FileDb {
@@ -85,6 +89,7 @@ function emptyDb(): FileDb {
     alertRules: [],
     humanPauses: [],
     metricRollups: [],
+    userProgress: [],
   };
 }
 
@@ -280,6 +285,16 @@ export class MemoryStore implements CloudStore {
     return this.db.metricRollups
       .filter((r) => r.projectId === projectId && (!flowId || r.flowId === flowId))
       .sort((a, b) => (a.flowId < b.flowId ? -1 : a.flowId > b.flowId ? 1 : a.windowDays - b.windowDays));
+  }
+  async getUserProgress(userId: string) {
+    return this.db.userProgress.find((p) => p.userId === userId);
+  }
+  async saveUserProgress(row: UserProgressRow) {
+    const i = this.db.userProgress.findIndex((p) => p.userId === row.userId);
+    if (i >= 0) this.db.userProgress[i] = row;
+    else this.db.userProgress.push(row);
+    this.touch();
+    return row;
   }
 }
 
