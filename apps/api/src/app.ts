@@ -3,7 +3,7 @@ import { cors } from "hono/cors";
 import { TIER_QUOTAS, type BillingTier, type Span } from "@veriflow/schema";
 import { spansToOtlp } from "@veriflow/telemetry";
 import { runAgentTest } from "@veriflow/harness";
-import type { MetricRollupRow, RunRow } from "./auth.js";
+import type { MetricRollupRow } from "./auth.js";
 import {
   hashPassword,
   hashToken,
