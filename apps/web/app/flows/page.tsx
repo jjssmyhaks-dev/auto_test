@@ -111,7 +111,18 @@ export default function FlowsPage() {
   }
 
   return (
-    <AppPage kicker="Flows" title="Saved objectives, ready to re-run.">
+    <AppPage
+      kicker="Flows"
+      title="Saved objectives, ready to re-run."
+      hint={{
+        steps: [
+          "Every cloud run is saved as a flow automatically — no extra setup.",
+          "Queue re-run replays the objective against today's app: your regression suite.",
+          "The Reliability table is 7/30-day rollups (success, self-heal, cost) — refreshed on demand, never raw spans.",
+        ],
+        cli: "npx veriflow flows",
+      }}
+    >
       <p className="empty">
         Flows come from `veriflow run` (saved automatically), `veriflow import`, or the form below. Re-run queues a cloud
         record; the CLI still owns the browser.

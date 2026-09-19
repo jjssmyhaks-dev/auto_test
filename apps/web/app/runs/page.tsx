@@ -59,14 +59,28 @@ export default function RunsPage() {
     );
   }
   if (!runs) {
-    return (
-      <AppPage kicker="Runs" title="Queue an objective.">
-        <p className="empty">Loading runs…</p>
+    return (    <AppPage
+      kicker="Runs"
+      title="Queue an objective."
+      hint={{ steps: ["Queue the run, then open it in the history below to scrub the trace."] }}
+    >
+      <p className="empty">Loading runs…</p>
       </AppPage>
     );
   }
   return (
-    <AppPage kicker="Runs" title="Queue an objective.">
+    <AppPage
+      kicker="Runs"
+      title="Queue an objective."
+      hint={{
+        steps: [
+          "Write the goal in plain English — what should happen, not which clicks to make.",
+          "Queue the run; Veriflow observes, acts, and verifies each step against the live page.",
+          "Open a run in the history to scrub its trace, screenshots, and spans.",
+        ],
+        cli: "npx veriflow run \"sign in and reach the dashboard\"",
+      }}
+    >
       <p className="empty">
         Queue an objective here (cloud record). The browser harness still runs on the CLI — this does not start Chromium from the dashboard.
       </p>

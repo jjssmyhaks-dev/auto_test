@@ -43,7 +43,17 @@ export default function RunDetailPage() {
   }
 
   return (
-    <AppPage kicker="Run" title={trace.run.objective || trace.run.id}>
+    <AppPage
+      kicker="Run"
+      title={trace.run.objective || trace.run.id}
+      hint={{
+        steps: [
+          "The timeline strip is the scrubber: click any mark (or use ←/→) to jump between steps.",
+          "The filmstrip shows every step's screenshot — click a frame to inspect that moment.",
+          "Each step lists its spans; failed steps show the guardrail or assertion that rejected them.",
+        ],
+      }}
+    >
       <p>
         Status <strong>{trace.run.status}</strong>
         {trace.run.error ? ` — ${trace.run.error}` : ""}

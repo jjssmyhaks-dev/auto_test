@@ -49,7 +49,17 @@ export default function ProjectsPage() {
   }
 
   return (
-    <AppPage kicker="Projects" title="Keys for MCP and sync.">
+    <AppPage
+      kicker="Projects"
+      title="Keys for MCP and sync."
+      hint={{
+        steps: [
+          "API keys authenticate the CLI, `veriflow login`, and MCP sync calls.",
+          "Mint a key, copy it once (it isn't shown again), and run `veriflow login --token …` on your machine.",
+        ],
+        cli: "npx veriflow login --token <your-key>",
+      }}
+    >
       <label>
         Project
         <select value={selected} onChange={(e) => setSelected(e.target.value)}>

@@ -52,7 +52,16 @@ export default function UsagePage() {
   }
 
   return (
-    <AppPage kicker="Usage" title="Free, Starter, Team.">
+    <AppPage
+      kicker="Usage"
+      title="Free, Starter, Team."
+      hint={{
+        steps: [
+          "Runs and agent-tests consume quota; every event writes to the ledger below.",
+          "Alert rules fire on cost spikes or success-rate drops before you burn the month's quota.",
+        ],
+      }}
+    >
       <p>
         Plan <strong>{usage.quota.label}</strong> — {usage.used} / {usage.quota.runsPerMonth} cloud runs this
         month ({usage.remaining} remaining).

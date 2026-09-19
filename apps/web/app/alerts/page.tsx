@@ -73,7 +73,16 @@ export default function AlertsPage() {
   }
 
   return (
-    <AppPage kicker="Alerts" title="Cost and success rate.">
+    <AppPage
+      kicker="Alerts"
+      title="Cost and success rate."
+      hint={{
+        steps: [
+          "Rules watch per-flow reliability — e.g. fire when success drops below 50% or cost spikes.",
+          "Create a rule, and it evaluates on every run event; webhook payloads include the rules that triggered.",
+        ],
+      }}
+    >
       <p className="empty">Delivery: {delivery} (cost_spike / success_rate)</p>
       {alerts.length === 0 ? (
         <p>No alerts on recent cloud runs.</p>

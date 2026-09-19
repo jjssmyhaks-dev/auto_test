@@ -30,6 +30,7 @@ export function SiteChrome({ children }: { children: ReactNode }) {
           </Link>
           <span className="flex items-center gap-4">
             <TourButton />
+            <TourButton interactive />
             <Link href="/login" className="font-mono text-[10px] uppercase no-underline md:hidden">
               Account
             </Link>

@@ -53,7 +53,17 @@ export default function EvidencePage() {
   }
 
   return (
-    <AppPage kicker="Evidence" title="Replay a packed run.">
+    <AppPage
+      kicker="Evidence"
+      title="Replay a packed run."
+      hint={{
+        steps: [
+          "Each cloud run carries a tamper-hashed evidence pack — inputs, model outputs, and proof it wasn't altered.",
+          "Pick a run to replay its conversation inline; the CLI ships the same pack via `veriflow export`.",
+        ],
+        cli: "npx veriflow export --run <id>",
+      }}
+    >
       {runs.length === 0 ? (
         <p className="empty">
           No synced runs. Queue an objective on <Link href="/runs">Runs</Link> or `veriflow run … --sync`.

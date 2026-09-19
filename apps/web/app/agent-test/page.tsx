@@ -61,7 +61,17 @@ export default function AgentTestPage() {
   }
 
   return (
-    <AppPage kicker="Agent tests" title="Score a transcript.">
+    <AppPage
+      kicker="Agent tests"
+      title="Score a transcript."
+      hint={{
+        steps: [
+          "Point the chat endpoint at your bot and run the eval — scenarios probe errors, refusals, topic switches, PII caution.",
+          "Every eval is ingested as a first-class run, so scores show up in Runs and reliability rollups.",
+        ],
+        cli: "npx veriflow agent-test --endpoint http://localhost:8788/chat",
+      }}
+    >
       <p className="empty">
         Paste JSON from <code>veriflow agent-test --endpoint …</code>, or submit <code>sample</code> to preview the
         conversation UI without a live model.

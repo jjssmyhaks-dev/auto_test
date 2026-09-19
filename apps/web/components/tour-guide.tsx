@@ -3,6 +3,15 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 
+export interface TourWait {
+  /** Selector the action must happen inside. */
+  selector: string;
+  /** DOM event that counts as performing the action. */
+  event: "click" | "input" | "change";
+  /** Instruction shown while waiting, e.g. "Type an objective in the box". */
+  hint: string;
+}
+
 export interface TourStep {
   /** Route the step is shown on. The tour navigates there if needed. */
   path: string;
@@ -14,6 +23,8 @@ export interface TourStep {
   body: string;
   /** Optional command shown in a code style at the bottom of the card. */
   cli?: string;
+  /** In interactive mode, the real user action this step waits for. */
+  waitFor?: TourWait;
 }
 
 export const TOUR_STEPS: TourStep[] = [
@@ -24,7 +35,8 @@ export const TOUR_STEPS: TourStep[] = [
     title: "Queue an objective",
     body:
       "Everything starts with a plain-English objective. Type one here and Veriflow queues a cloud record — the browser harness itself runs from your CLI, keeping the browser (and your credentials) local.",
-    cli: "veriflow run \"log in, add an item to the cart, assert the total\"",
+    cli: 'veriflow run "log in, add an item to the cart, assert the total"',
+    waitFor: { selector: "main textarea", event: "input", hint: "Type an objective in the box below" },
   },
   {
     path: "/runs",
@@ -33,6 +45,7 @@ export const TOUR_STEPS: TourStep[] = [
     title: "Every run keeps its paper trail",
     body:
       "Each row is one execution: status, objective, when it ran, and what it cost. Click a run to open its trace.",
+    waitFor: { selector: "main table tbody a", event: "click", hint: "Open a run from the history" },
   },
   {
     path: "/runs/:first",
@@ -41,6 +54,11 @@ export const TOUR_STEPS: TourStep[] = [
     title: "Scrub the run like a video",
     body:
       "This is the evidence: a timeline of steps synced to screenshots, the action taken, guard verdicts, and what VERIFY checked at each step. Arrow keys scrub; the filmstrip below shows every screenshot at a glance.",
+    waitFor: {
+      selector: '[aria-label="Trace scrubber"]',
+      event: "click",
+      hint: "Scrub the timeline or click a filmstrip frame",
+    },
   },
   {
     path: "/flows",
@@ -49,6 +67,7 @@ export const TOUR_STEPS: TourStep[] = [
     body:
       "Every run automatically saves its objective as a Flow. Re-run a flow to regression-check it later, or import existing Playwright tests so migration doesn't start from zero.",
     cli: "veriflow import --from playwright ./checkout.spec.ts",
+    waitFor: { selector: "main table button", event: "click", hint: "Queue a re-run of a flow" },
   },
   {
     path: "/evidence",
@@ -57,6 +76,7 @@ export const TOUR_STEPS: TourStep[] = [
     body:
       "Non-technical teammates can open a packed run — screenshots, traces, network, console — without installing anything. Secrets are redacted before anything leaves your machine.",
     cli: "veriflow trace <run-id>",
+    waitFor: { selector: "main select", event: "change", hint: "Pick a run to replay its evidence" },
   },
   {
     path: "/agent-test",
@@ -86,9 +106,13 @@ export const TOUR_STEPS: TourStep[] = [
 
 const TOUR_KEY = "veriflow_tour_done";
 
+type TourApi = { start: (opts?: { interactive?: boolean }) => void };
+
 export function TourGuide() {
   const router = useRouter();
   const [active, setActive] = useState(false);
+  const [interactive, setInteractive] = useState(false);
+  const [acted, setActed] = useState(false);
   const [index, setIndex] = useState(0);
   const [box, setBox] = useState<{ x: number; y: number; w: number; h: number } | null>(null);
 
@@ -96,21 +120,23 @@ export function TourGuide() {
   const pathname = typeof window !== "undefined" ? window.location.pathname : "/";
   const vh = typeof window !== "undefined" ? window.innerHeight : 800;
 
-  const start = useCallback(() => {
+  const start = useCallback((opts?: { interactive?: boolean }) => {
     setIndex(0);
+    setInteractive(opts?.interactive ?? false);
+    setActed(false);
     setActive(true);
   }, []);
 
-  // Expose start to the header button and auto-start for first-time visitors.
+  // Expose start to the header buttons and auto-start for first-time visitors.
   useEffect(() => {
-    (window as unknown as { __veriflowTour?: { start: () => void } }).__veriflowTour = { start };
+    (window as unknown as { __veriflowTour?: TourApi }).__veriflowTour = { start };
     if (typeof window !== "undefined" && !localStorage.getItem(TOUR_KEY)) {
       start();
       localStorage.setItem(TOUR_KEY, "1");
     }
   }, [start]);
 
-  const targetSelector = step.target;
+  const targetSelector = step?.target;
   useEffect(() => {
     if (!active || !targetSelector) {
       setBox(null);
@@ -153,29 +179,63 @@ export function TourGuide() {
       // "/runs/:first" means "the most recent run's detail page" when one exists.
       let path = target.path;
       if (path === "/runs/:first") {
-        const firstRun = document.querySelector<HTMLAnchorElement>("main table tbody a");
-        path = firstRun?.getAttribute("href") ?? "/runs";
+        if (/^\/runs\/[^/]+$/.test(window.location.pathname)) {
+          // Already on a run detail page (e.g. the user just clicked a run) — stay put.
+          path = window.location.pathname;
+        } else {
+          const firstRun = document.querySelector<HTMLAnchorElement>("main table tbody a");
+          path = firstRun?.getAttribute("href") ?? "/runs";
+        }
       }
       if (window.location.pathname !== path) router.push(path);
     },
     [router],
   );
 
+  // Interactive mode: listen (capture) for the real user action on this step's
+  // target, mark it done, and auto-advance shortly after.
+  const waitFor = interactive ? step?.waitFor : undefined;
+  useEffect(() => {
+    if (!active || !waitFor || acted) return;
+    const { selector, event } = waitFor;
+    const handler = (e: Event) => {
+      const t = e.target as Element | null;
+      if (!t || typeof t.closest !== "function" || !t.closest(selector)) return;
+      setActed(true);
+    };
+    document.addEventListener(event, handler, true);
+    return () => document.removeEventListener(event, handler, true);
+  }, [active, waitFor, acted]);
+
+  useEffect(() => {
+    if (!acted || !active) return;
+    const t = window.setTimeout(() => {
+      if (index < TOUR_STEPS.length - 1) go(index + 1);
+      else finish();
+    }, 700);
+    return () => window.clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [acted]);
+
+  // Reset the action flag whenever the step or mode changes.
+  useEffect(() => setActed(false), [index, interactive]);
+
   useEffect(() => {
     if (!active) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") finish();
-      if (e.key === "ArrowRight") go(index + 1);
+      if (e.key === "ArrowRight" && !(interactive && waitFor && !acted)) go(index + 1);
       if (e.key === "ArrowLeft") go(index - 1);
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [active, index, go, finish]);
+  }, [active, index, go, finish, interactive, waitFor, acted]);
 
   const progress = useMemo(() => `${index + 1} / ${TOUR_STEPS.length}`, [index]);
 
   if (!active || !step) return null;
 
+  const waiting = interactive && !!waitFor && !acted;
   const cardStyle: React.CSSProperties = box
     ? // Prefer the side with more room, then clamp into the viewport so the
       // card is always on-screen even for tall spotlight targets.
@@ -186,10 +246,12 @@ export function TourGuide() {
 
   return (
     <>
-      {/* Spotlight + click-blocking backdrop */}
+      {/* Spotlight + click-blocking backdrop. In interactive mode the page stays
+          live so the user can actually perform the step's action. */}
       <div
         className="fixed inset-0 z-[90] bg-background/70"
-        onClick={finish}
+        style={{ pointerEvents: interactive ? "none" : "auto" }}
+        onClick={interactive ? undefined : finish}
         role="presentation"
       />
       {box ? (
@@ -213,21 +275,33 @@ export function TourGuide() {
             {step.cli}
           </pre>
         ) : null}
+        {interactive && waitFor ? (
+          <p className="mt-3 border border-primary/40 bg-primary/5 p-2 font-mono text-[11px] uppercase text-primary">
+            {acted ? "✓ done — advancing…" : `Your turn: ${waitFor.hint}`}
+          </p>
+        ) : null}
         <div className="mt-4 flex items-center gap-2">
           <button type="button" onClick={() => go(index - 1)} disabled={index === 0}>
             ‹ Back
           </button>
           {index < TOUR_STEPS.length - 1 ? (
-            <button type="button" onClick={() => go(index + 1)}>
-              Next ›
+            <button type="button" onClick={() => go(index + 1)} disabled={waiting}>
+              {waiting ? "Waiting…" : "Next ›"}
             </button>
           ) : (
-            <button type="button" onClick={finish}>
-              Finish
+            <button type="button" onClick={finish} disabled={waiting}>
+              {waiting ? "Waiting…" : "Finish"}
             </button>
           )}
+          <button
+            type="button"
+            className="ml-2 font-mono text-[10px] uppercase"
+            onClick={() => setInteractive((v) => !v)}
+          >
+            {interactive ? "Guided mode" : "Try it"}
+          </button>
           <span className="ml-auto font-mono text-[10px] uppercase text-foreground/60">
-            {progress} · {pathname === step.path ? "here" : `→ ${step.path}`}
+            {progress} · {pathname === step.path || (step.path === "/runs/:first" && /^\/runs\/[^/]+$/.test(pathname)) ? "here" : `→ ${step.path}`}
           </span>
         </div>
       </aside>
@@ -236,7 +310,7 @@ export function TourGuide() {
 }
 
 /** Header button: restarts the tour on demand. */
-export function TourButton() {
+export function TourButton({ interactive = false }: { interactive?: boolean }) {
   const [mounted, setMounted] = useState(false);
   useEffect(() => setMounted(true), []);
   return (
@@ -245,11 +319,11 @@ export function TourButton() {
       className="font-mono text-[10px] uppercase"
       onClick={() => {
         localStorage.removeItem(TOUR_KEY);
-        (window as unknown as { __veriflowTour?: { start: () => void } }).__veriflowTour?.start();
+        (window as unknown as { __veriflowTour?: TourApi }).__veriflowTour?.start({ interactive });
       }}
       style={{ visibility: mounted ? "visible" : "hidden" }}
     >
-      ? Tour
+      {interactive ? "? Try it" : "? Tour"}
     </button>
   );
 }
