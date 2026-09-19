@@ -94,9 +94,14 @@ export function markOnboardingAction(key: OnboardingAction) {
   pushRemote(s);
 }
 
-export function resetOnboarding() {
+/**
+ * Clear all onboarding progress. `skipRemote` when the caller has already
+ * cleared the account row server-side (Settings does DELETE /v1/progress
+ * first) — pushing an empty row back would defeat the reset.
+ */
+export function resetOnboarding(opts?: { skipRemote?: boolean }) {
   writeLocal({ done: {}, dismissed: false });
-  pushRemote({ done: {}, dismissed: false });
+  if (!opts?.skipRemote) pushRemote({ done: {}, dismissed: false });
 }
 
 export function dismissOnboarding() {

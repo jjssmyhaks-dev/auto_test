@@ -228,6 +228,45 @@ describe("Veriflow API", () => {
     // It persists across "sessions".
     const again = await json(app, "/v1/progress", { headers: auth });
     expect((again.body.progress as { tourStep?: number }).tourStep).toBeUndefined();
+
+    // Reset onboarding: DELETE clears the account row entirely.
+    const cleared = await json(app, "/v1/progress", { method: "DELETE", headers: auth });
+    expect(cleared.status).toBe(200);
+    expect(cleared.body).toEqual({ status: "cleared", deleted: true });
+    const afterReset = await json(app, "/v1/progress", { headers: auth });
+    expect((afterReset.body.progress as { onboardingDone: string[] }).onboardingDone).toEqual([]);
+    // Second delete reports nothing removed.
+    const clearedAgain = await json(app, "/v1/progress", { method: "DELETE", headers: auth });
+    expect(clearedAgain.body).toEqual({ status: "cleared", deleted: false });
+  });
+
+  it("aggregates the onboarding funnel across accounts", async () => {
+    const app = createApp({ store: new MemoryStore(), blobs: new FsBlobStore(join(tmpdir(), "vf-funnel")) });
+    const signup = async (email: string) => {
+      const r = await json(app, "/v1/auth/signup", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ email, password: "password1" }),
+      });
+      return { authorization: `Bearer ${r.body.token as string}`, "content-type": "application/json" };
+    };
+    const a = await signup("f1@example.com");
+    const b = await signup("f2@example.com");
+    await json(app, "/v1/progress", { method: "PUT", headers: a, body: JSON.stringify({ onboardingDone: ["queue_run", "scrub_trace"] }) });
+    await json(app, "/v1/progress", { method: "PUT", headers: b, body: JSON.stringify({ onboardingDone: ["queue_run"] }) });
+
+    const funnel = await json(app, "/v1/onboarding/funnel", { headers: a });
+    expect(funnel.status).toBe(200);
+    const body = funnel.body as {
+      total: number;
+      steps: { action: string; count: number; pct: number }[];
+      completedAll: number;
+    };
+    expect(body.total).toBe(2);
+    expect(body.steps.find((s) => s.action === "queue_run")).toEqual({ action: "queue_run", count: 2, pct: 100 });
+    expect(body.steps.find((s) => s.action === "scrub_trace")).toEqual({ action: "scrub_trace", count: 1, pct: 50 });
+    expect(body.steps.find((s) => s.action === "create_flow")?.count).toBe(0);
+    expect(body.completedAll).toBe(0);
   });
 
   it("creates, lists, and resolves a human pause (CI magic link)", async () => {

@@ -108,7 +108,8 @@ export function createApp(deps?: Partial<AppDeps>) {
         "/v1/human-pauses/{id}": { get: {} },
         "/v1/human-pauses/{id}/resolve": { post: {} },
         "/v1/agent-tests": { post: {} },
-        "/v1/progress": { get: {}, put: {} },
+        "/v1/progress": { get: {}, put: {}, delete: {} },
+        "/v1/onboarding/funnel": { get: {} },
         "/v1/metrics/rollups": { get: {} },
         "/v1/metrics/rollups/refresh": { post: {} },
         "/v1/metrics/{flowId}": { get: {} },
@@ -712,6 +713,31 @@ export function createApp(deps?: Partial<AppDeps>) {
     };
     const saved = await store.saveUserProgress(row);
     return c.json({ progress: saved });
+  });
+
+  // Reset onboarding: clears the account's progress entirely (local cache is
+  // cleared client-side alongside this call from Settings).
+  app.delete("/v1/progress", async (c) => {
+    const { ctx, error } = await requireAuth(c);
+    if (!ctx) return error;
+    const deleted = await store.deleteUserProgress(ctx.user.id);
+    return c.json({ status: "cleared", deleted });
+  });
+
+  // Activation funnel: how many accounts completed each onboarding action —
+  // powers the drop-off view on the usage page.
+  app.get("/v1/onboarding/funnel", async (c) => {
+    const { ctx, error } = await requireAuth(c);
+    if (!ctx) return error;
+    const all = await store.listAllUserProgress();
+    const actions = ["queue_run", "scrub_trace", "create_flow", "create_alert_rule"];
+    const total = all.length;
+    const steps = actions.map((action) => {
+      const count = all.filter((p) => p.onboardingDone.includes(action)).length;
+      return { action, count, pct: total === 0 ? 0 : Math.round((count / total) * 100) };
+    });
+    const completedAll = all.filter((p) => actions.every((a) => p.onboardingDone.includes(a))).length;
+    return c.json({ total, steps, completedAll });
   });
 
   // Spec §4: precomputed metric rollups — refresh recomputes per-flow 7/30-day

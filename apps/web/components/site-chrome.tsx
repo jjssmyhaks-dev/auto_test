@@ -14,6 +14,7 @@ const appLinks = [
   ["/projects", "Projects"],
   ["/usage", "Usage"],
   ["/alerts", "Alerts"],
+  ["/settings", "Settings"],
 ] as const;
 
 export function SiteChrome({ children }: { children: ReactNode }) {

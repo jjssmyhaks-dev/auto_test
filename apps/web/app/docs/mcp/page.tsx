@@ -1,4 +1,5 @@
 import { AppPage } from "@/components/app-page";
+import { TryItPrompt } from "@/components/try-it-prompt";
 
 export const metadata = { title: "MCP setup · Veriflow" };
 
@@ -74,6 +75,7 @@ export default function McpDocsPage() {
           </pre>
         </div>
       ))}
+      <TryItPrompt />
     </AppPage>
   );
 }

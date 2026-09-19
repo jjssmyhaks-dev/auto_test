@@ -12,8 +12,22 @@ type Usage = {
   ledger: { kind: string; amount: number; unit: string; createdAt: string; runId?: string }[];
 };
 
+type Funnel = {
+  total: number;
+  completedAll: number;
+  steps: { action: string; count: number; pct: number }[];
+};
+
+const FUNNEL_LABELS: Record<string, string> = {
+  queue_run: "Queue a run",
+  scrub_trace: "Scrub a trace",
+  create_flow: "Save a flow",
+  create_alert_rule: "Create an alert rule",
+};
+
 export default function UsagePage() {
   const [usage, setUsage] = useState<Usage | null>(null);
+  const [funnel, setFunnel] = useState<Funnel | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [note, setNote] = useState<string | null>(null);
 
@@ -21,6 +35,9 @@ export default function UsagePage() {
     api<Usage>("/v1/usage")
       .then(setUsage)
       .catch((e: Error) => setError(e.message));
+    api<Funnel>("/v1/onboarding/funnel")
+      .then(setFunnel)
+      .catch(() => {});
   }
 
   useEffect(() => {
@@ -100,6 +117,41 @@ export default function UsagePage() {
           </tbody>
         </table>
       )}
+      {funnel ? (
+        <section aria-label="Activation funnel">
+          <h2>Activation funnel</h2>
+          <p className="text-sm text-foreground/70">
+            How many accounts completed each getting-started action{funnel.total ? ` — ${funnel.total} account${funnel.total === 1 ? "" : "s"} with progress so far` : ""}.
+          </p>
+          {funnel.total === 0 ? (
+            <p className="empty">No accounts with onboarding progress yet.</p>
+          ) : (
+            <table>
+              <thead>
+                <tr>
+                  <th>Action</th>
+                  <th>Accounts</th>
+                  <th>Share</th>
+                </tr>
+              </thead>
+              <tbody>
+                {funnel.steps.map((s) => (
+                  <tr key={s.action}>
+                    <td>{FUNNEL_LABELS[s.action] ?? s.action}</td>
+                    <td>{s.count}</td>
+                    <td>{s.pct}%</td>
+                  </tr>
+                ))}
+                <tr>
+                  <td>All four done</td>
+                  <td>{funnel.completedAll}</td>
+                  <td>{funnel.total === 0 ? 0 : Math.round((funnel.completedAll / funnel.total) * 100)}%</td>
+                </tr>
+              </tbody>
+            </table>
+          )}
+        </section>
+      ) : null}
     </AppPage>
   );
 }

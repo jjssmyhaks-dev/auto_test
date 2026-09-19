@@ -523,6 +523,21 @@ export class PgStore implements CloudStore {
     );
     return row;
   }
+  async deleteUserProgress(userId: string): Promise<boolean> {
+    const res = await this.pool.query(`DELETE FROM user_progress WHERE user_id=$1`, [userId]);
+    return (res.rowCount ?? 0) > 0;
+  }
+  async listAllUserProgress(): Promise<UserProgressRow[]> {
+    const res = await this.pool.query(`SELECT * FROM user_progress`);
+    return res.rows.map((r) => ({
+      userId: r.user_id,
+      onboardingDone: r.onboarding_done ?? [],
+      onboardingDismissed: r.onboarding_dismissed,
+      tourStep: r.tour_step ?? undefined,
+      tourMode: r.tour_mode ?? undefined,
+      updatedAt: new Date(r.updated_at).toISOString(),
+    }));
+  }
 
   private mapRun(r: pg.QueryResultRow): RunRow {
     return {

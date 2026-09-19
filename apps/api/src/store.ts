@@ -57,6 +57,8 @@ export interface CloudStore {
   listMetricRollups(projectId: string, flowId?: string): Promise<MetricRollupRow[]>;
   getUserProgress(userId: string): Promise<UserProgressRow | undefined>;
   saveUserProgress(row: UserProgressRow): Promise<UserProgressRow>;
+  deleteUserProgress(userId: string): Promise<boolean>;
+  listAllUserProgress(): Promise<UserProgressRow[]>;
 }
 
 interface FileDb {
@@ -295,6 +297,15 @@ export class MemoryStore implements CloudStore {
     else this.db.userProgress.push(row);
     this.touch();
     return row;
+  }
+  async deleteUserProgress(userId: string) {
+    const before = this.db.userProgress.length;
+    this.db.userProgress = this.db.userProgress.filter((p) => p.userId !== userId);
+    this.touch();
+    return this.db.userProgress.length < before;
+  }
+  async listAllUserProgress() {
+    return [...this.db.userProgress];
   }
 }
 

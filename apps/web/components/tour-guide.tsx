@@ -103,6 +103,14 @@ export const TOUR_STEPS: TourStep[] = [
       "The same engine is exposed over MCP: run_flow, get_run, get_trace, export_playwright, list_flows. Claude Code or Cursor can verify their own work mid-session without leaving the chat.",
     cli: "npx @veriflow/mcp --stdio",
   },
+  {
+    path: "/docs/cli",
+    target: "main ol",
+    kicker: "09 · DOCS",
+    title: "Keep the docs at hand",
+    body:
+      "The CLI quickstart and MCP setup pages cover everything a human or a coding agent needs to drive Veriflow outside the dashboard. Reach them any time from the completion card or the nav.",
+  },
 ];
 
 const TOUR_KEY = "veriflow_tour_done";

@@ -1,4 +1,5 @@
 import { AppPage } from "@/components/app-page";
+import { TryItPrompt } from "@/components/try-it-prompt";
 
 export const metadata = { title: "CLI quickstart · Veriflow" };
 
@@ -50,6 +51,7 @@ export default function CliDocsPage() {
           </li>
         ))}
       </ol>
+      <TryItPrompt />
     </AppPage>
   );
 }
