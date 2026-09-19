@@ -27,11 +27,13 @@ jobs:
       - name: Install Playwright Chromium (for the golden-flow suite)
         run: pnpm playwright:install
 
-      - name: Typecheck (all workspaces)
-        run: pnpm typecheck
-
+      # Build before typecheck: packages resolve @veriflow/* types from dist
+      # output, which a fresh checkout does not have yet.
       - name: Build packages
         run: pnpm --filter "./packages/*" build
+
+      - name: Typecheck (all workspaces)
+        run: pnpm typecheck
 
       - name: Unit + golden-flow tests
         run: pnpm test
