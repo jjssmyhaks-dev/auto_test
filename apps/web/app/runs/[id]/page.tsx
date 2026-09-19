@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { useParams } from "next/navigation";
 import { api } from "@/lib/api";
 import { RunTraceView } from "@/components/run-trace-view";
+import Link from "next/link";
 import { TraceScrubber } from "@/components/trace-scrubber";
 import { AppPage } from "@/components/app-page";
 
@@ -61,6 +62,11 @@ export default function RunDetailPage() {
       <RunTraceView objective={trace.run.objective} steps={trace.steps} spans={trace.spans} />
       <h2>Scrubber</h2>
       <TraceScrubber steps={trace.steps} spans={trace.spans} screenshots={trace.screenshots} />
+      <p className="mt-2 text-sm">
+        <Link href={`/runs/compare?a=${trace.run.id}&b=`} className="underline">
+          Compare this run against another →
+        </Link>
+      </p>
       {trace.capture?.network?.length ? (
         <>
           <h2>Network</h2>

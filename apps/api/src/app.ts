@@ -1,8 +1,9 @@
-import { Hono } from "hono";
+import { Hono, type Context } from "hono";
 import { cors } from "hono/cors";
 import { TIER_QUOTAS, type BillingTier, type Span } from "@veriflow/schema";
 import { spansToOtlp } from "@veriflow/telemetry";
-import { runAgentTest } from "@veriflow/harness";
+import { runAgentTest, runRedTeam, parseCron, compareSteps, verifyStripeSignature } from "@veriflow/harness";
+import { rateLimit, SESSION_TTL_MS } from "./store.js";
 import type { MetricRollupRow } from "./auth.js";
 import {
   hashPassword,
@@ -99,6 +100,15 @@ export function createApp(deps?: Partial<AppDeps>) {
         "/v1/runs/{id}/otlp": { get: {} },
         "/v1/runs/{id}/blobs/{path}": { get: {} },
         "/v1/flows": { get: {}, post: {} },
+        "/v1/schedules/claim": { post: {} },
+        "/v1/devices": { get: {}, post: {} },
+        "/v1/devices/{id}/heartbeat": { post: {} },
+        "/v1/devices/{id}/claim": { post: {} },
+        "/v1/device-jobs": { get: {}, post: {} },
+        "/v1/device-jobs/{id}/complete": { post: {} },
+        "/v1/billing/stripe-webhook": { post: {} },
+        "/v1/redteam": { post: {} },
+        "/v1/compare": { get: {} },
         "/v1/usage": { get: {} },
         "/v1/billing/upgrade": { post: {} },
         "/v1/alerts": { get: {} },
@@ -124,8 +134,43 @@ export function createApp(deps?: Partial<AppDeps>) {
     return token;
   };
 
+  // Opportunistic session purge — cheap when nothing is expired, and it
+  // keeps long-running deployments from accumulating dead rows.
+  let lastPurge = 0;
+  const maybePurgeSessions = () => {
+    const now = Date.now();
+    if (now - lastPurge > 60 * 60 * 1000) {
+      lastPurge = now;
+      void store.purgeExpiredSessions().catch(() => {});
+    }
+  };
+
+  // Fixed-window rate limit for credential endpoints (per IP): 10 attempts
+  // per 5 minutes. Returns a 429 response when tripped, else undefined.
+  const authRateLimit = (c: Context) => {
+    const ip =
+      c.req.header("x-forwarded-for")?.split(",")[0]?.trim() ||
+      (c.env as { incoming?: { socket?: { remoteAddress?: string } } } | undefined)?.incoming?.socket?.remoteAddress ||
+      "unknown";
+    const rl = rateLimit(`auth:${ip}`, 10, 5 * 60 * 1000);
+    if (!rl.ok) return c.json({ error: "too many attempts", retryAfter: rl.retryAfter }, 429) as unknown as Response;
+    return undefined;
+  };
+
+  // Set the session as an httpOnly cookie when requested (browser keeps no
+  // JS-readable copy), while still returning the token for CLI/API use.
+  const sessionCookie = (c: { header: (n: string, v: string) => void }, token: string, setCookie: boolean) => {
+    if (!setCookie) return;
+    c.header(
+      "set-cookie",
+      `vf_session=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${Math.floor(SESSION_TTL_MS / 1000)}`,
+    );
+  };
+
   app.post("/v1/auth/signup", async (c) => {
-    const body = (await c.req.json()) as { email?: string; password?: string };
+    const limited = authRateLimit(c);
+    if (limited) return limited;
+    const body = (await c.req.json()) as { email?: string; password?: string; setCookie?: boolean };
     if (!body.email || !body.password || body.password.length < 8) {
       return c.json({ error: "email and password (8+ chars) required" }, 400);
     }
@@ -133,6 +178,8 @@ export function createApp(deps?: Partial<AppDeps>) {
       const user = await store.createUser(body.email, hashPassword(body.password));
       const project = await store.createProject(user.id, "Default");
       const token = await issueSession(user.id);
+      maybePurgeSessions();
+      sessionCookie(c, token, body.setCookie === true);
       return c.json({ token, user: { id: user.id, email: user.email, tier: user.tier }, project });
     } catch (err) {
       const status = (err as { status?: number }).status === 409 ? 409 : 400;
@@ -141,13 +188,17 @@ export function createApp(deps?: Partial<AppDeps>) {
   });
 
   app.post("/v1/auth/login", async (c) => {
-    const body = (await c.req.json()) as { email?: string; password?: string };
+    const limited = authRateLimit(c);
+    if (limited) return limited;
+    const body = (await c.req.json()) as { email?: string; password?: string; setCookie?: boolean };
     const user = body.email ? await store.getUserByEmail(body.email) : undefined;
     if (!user || !body.password || !verifyPassword(body.password, user.passwordHash)) {
       return c.json({ error: "invalid credentials" }, 401);
     }
     const token = await issueSession(user.id);
     const projects = await store.listProjects(user.id);
+    maybePurgeSessions();
+    sessionCookie(c, token, body.setCookie === true);
     return c.json({ token, user: { id: user.id, email: user.email, tier: user.tier }, projects });
   });
 
@@ -169,6 +220,19 @@ export function createApp(deps?: Partial<AppDeps>) {
       const user = await store.getUser(session.userId);
       if (!user) return undefined;
       return { user, via: "session" };
+    }
+    // httpOnly cookie fallback (SET_VIA_COOKIE deployments): the browser
+    // never holds the raw token in JS-readable storage.
+    const cookie = c.req.header("cookie");
+    if (cookie) {
+      const match = /(?:^|;\s*)vf_session=([A-Za-z0-9._~+/=-]+)/.exec(cookie);
+      if (match) {
+        const session = await store.getSession(hashToken(match[1]));
+        if (!session) return undefined;
+        const user = await store.getUser(session.userId);
+        if (!user) return undefined;
+        return { user, via: "session" };
+      }
     }
     return undefined;
   };
@@ -342,6 +406,39 @@ export function createApp(deps?: Partial<AppDeps>) {
     return c.json({ id: runId, quota: { used: used + 1, limit: quota, tier: ctx.user.tier } });
   });
 
+  // Side-by-side run comparison: align steps by index, diff type/status,
+  // and surface each side's screenshot blob paths for the filmstrip.
+  app.get("/v1/compare", async (c) => {
+    const { ctx, error } = await requireAuth(c);
+    if (!ctx) return error;
+    const a = c.req.query("a");
+    const b = c.req.query("b");
+    if (!a || !b) return c.json({ error: "a and b query params required" }, 400);
+    const runA = await store.getRun(a);
+    const runB = await store.getRun(b);
+    if (!runA || !runB || runA.projectId !== runB.projectId) return c.json({ error: "runs not found or in different projects" }, 404);
+    const project = await store.getProject(runA.projectId);
+    if (!project || project.userId !== ctx.user.id) return c.json({ error: "not found" }, 404);
+    const [stepsA, stepsB, blobsA, blobsB] = await Promise.all([
+      store.listSteps(runA.id),
+      store.listSteps(runB.id),
+      blobs.list(`${runA.id}/`),
+      blobs.list(`${runB.id}/`),
+    ]);
+    const shot = (prefix: string, list: string[], i: number) => list.find((k) => k.includes(`step-${i}`) && k.endsWith(".png")) ?? list.find((k) => k.endsWith(".png") && k.startsWith(prefix));
+    const rows = compareSteps(runA.id, runB.id, stepsA as never, stepsB as never, runA.status as never, runB.status as never, blobsA, blobsB);
+    // Attach screenshot blob paths per row index.
+    for (const row of rows.rows) {
+      const i = row.index;
+      const aShot = blobsA.find((k) => k.endsWith(".png") && k.includes(`step-${i}`));
+      const bShot = blobsB.find((k) => k.endsWith(".png") && k.includes(`step-${i}`));
+      void shot;
+      row.screenshotA = aShot ? `/v1/runs/${runA.id}/blobs/${aShot.replace(`${runA.id}/`, "")}` : undefined;
+      row.screenshotB = bShot ? `/v1/runs/${runB.id}/blobs/${bShot.replace(`${runB.id}/`, "")}` : undefined;
+    }
+    return c.json({ comparison: rows, stepsA, stepsB });
+  });
+
   app.get("/v1/runs/:id", async (c) => {
     const { ctx, error } = await requireAuth(c);
     if (!ctx) return error;
@@ -425,15 +522,38 @@ export function createApp(deps?: Partial<AppDeps>) {
     if (!ctx) return error;
     const project = await resolveProject(ctx);
     if (!project) return c.json({ error: "no project" }, 400);
-    const body = (await c.req.json()) as { id?: string; name?: string; objective?: string; envUrl?: string };
+    const body = (await c.req.json()) as { id?: string; name?: string; objective?: string; envUrl?: string; schedule?: string | null };
+    // Validate the cron expression up front so the scheduler never chokes.
+    if (body.schedule) {
+      try {
+        parseCron(body.schedule);
+      } catch (err) {
+        return c.json({ error: err instanceof Error ? err.message : "invalid schedule" }, 400);
+      }
+    }
+    const existing = body.id ? (await store.listFlows(project.id)).find((f) => f.id === body.id) : undefined;
     const flow = await store.saveFlow({
       id: body.id ?? newId("flow"),
       projectId: project.id,
       name: body.name ?? "flow",
       objective: body.objective ?? "",
       envUrl: body.envUrl,
+      schedule: body.schedule === null ? undefined : (body.schedule ?? existing?.schedule),
     });
     return c.json({ flow });
+  });
+
+  // Due-claim endpoint for external schedulers (cron, GitHub Actions, K8s
+  // CronJob): poll once a minute; every due flow is returned exactly once
+  // per matching minute. Then execute each with `veriflow run --flow`.
+  app.post("/v1/schedules/claim", async (c) => {
+    const { ctx, error } = await requireAuth(c);
+    if (!ctx) return error;
+    const project = await resolveProject(ctx, c.req.query("projectId"));
+    if (!project) return c.json({ due: [] });
+    const now = typeof (await c.req.json().catch(() => ({})))?.now === "string" ? new Date((await c.req.json().catch(() => ({}))).now) : new Date();
+    const due = await store.claimDueFlows(project.id, Number.isNaN(now.getTime()) ? new Date() : now);
+    return c.json({ due, now: new Date().toISOString() });
   });
 
   app.get("/v1/usage", async (c) => {
@@ -458,15 +578,155 @@ export function createApp(deps?: Partial<AppDeps>) {
     const body = (await c.req.json()) as { tier?: BillingTier };
     const tier = body.tier;
     if (!tier || !TIER_QUOTAS[tier]) return c.json({ error: "tier must be free|starter|team" }, 400);
-    if (process.env.STRIPE_SECRET_KEY) {
-      return c.json({
-        status: "stripe_not_wired",
-        message: "STRIPE_SECRET_KEY is set but checkout is simulated in this build",
-        checkoutUrl: `https://example.invalid/upgrade?tier=${tier}`,
+    // Live Stripe path: create a real Checkout Session (price IDs from env)
+    // and let the webhook below flip the tier on `checkout.session.completed`.
+    if (process.env.STRIPE_SECRET_KEY && process.env.STRIPE_PRICE_STARTER && process.env.STRIPE_PRICE_TEAM) {
+      const price = tier === "starter" ? process.env.STRIPE_PRICE_STARTER : process.env.STRIPE_PRICE_TEAM;
+      const res = await fetch("https://api.stripe.com/v1/checkout/sessions", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${process.env.STRIPE_SECRET_KEY}`,
+          "content-type": "application/x-www-form-urlencoded",
+        },
+        body: new URLSearchParams({
+          mode: "subscription",
+          "line_items[0][price]": price,
+          "line_items[0][quantity]": "1",
+          success_url: `${process.env.STRIPE_SUCCESS_URL ?? "http://localhost:3000/usage?upgraded=1"}`,
+          cancel_url: `${process.env.STRIPE_CANCEL_URL ?? "http://localhost:3000/usage"}`,
+          "metadata[userId]": ctx.user.id,
+          "metadata[tier]": tier,
+        }),
       });
+      const session = (await res.json()) as { id?: string; url?: string; error?: { message?: string } };
+      if (!res.ok || !session.url) {
+        return c.json({ error: session.error?.message ?? "stripe checkout failed" }, 502);
+      }
+      return c.json({ status: "checkout_created", checkoutUrl: session.url, sessionId: session.id });
     }
+    // No Stripe configured: simulated upgrade (local/dev behavior).
     const user = await store.setTier(ctx.user.id, tier);
     return c.json({ status: "upgraded", user: { id: user?.id, email: user?.email, tier: user?.tier } });
+  });
+
+  // Stripe webhook: flips the tier when checkout completes. Signature is
+  // verified with HMAC-SHA256 over `${timestamp}.${payload}` per Stripe's
+  // scheme (no SDK dependency).
+  app.post("/v1/billing/stripe-webhook", async (c) => {
+    const sig = c.req.header("stripe-signature");
+    const raw = await c.req.text();
+    const secret = process.env.STRIPE_WEBHOOK_SECRET;
+    if (!secret) return c.json({ error: "webhook secret not configured" }, 400);
+    if (!sig) return c.json({ error: "missing stripe-signature" }, 400);
+    const verified = verifyStripeSignature(raw, sig, secret);
+    if (!verified.ok) return c.json({ error: verified.reason }, 400);
+    const event = JSON.parse(raw) as {
+      type: string;
+      data: { object: { id: string; metadata?: { userId?: string; tier?: string }; subscription?: string } };
+    };
+    if (event.type !== "checkout.session.completed") {
+      return c.json({ received: true, ignored: event.type });
+    }
+    const userId = event.data.object.metadata?.userId;
+    const tier = event.data.object.metadata?.tier as BillingTier | undefined;
+    if (!userId || !tier || !TIER_QUOTAS[tier]) {
+      return c.json({ error: "missing metadata" }, 400);
+    }
+    const user = await store.setTier(userId, tier);
+    return c.json({ received: true, tier: user?.tier });
+  });
+
+  // Hosted device cloud: register, heartbeat, queue work, claim (FIFO).
+  app.post("/v1/devices", async (c) => {
+    const { ctx, error } = await requireAuth(c);
+    if (!ctx) return error;
+    const project = await resolveProject(ctx);
+    if (!project) return c.json({ error: "no project" }, 400);
+    const body = (await c.req.json().catch(() => ({}))) as { name?: string };
+    const device = await store.saveDevice({
+      id: newId("dev"),
+      projectId: project.id,
+      name: body.name ?? "device",
+      status: "online",
+      lastHeartbeatAt: new Date().toISOString(),
+      createdAt: new Date().toISOString(),
+    });
+    return c.json({ device });
+  });
+
+  app.get("/v1/devices", async (c) => {
+    const { ctx, error } = await requireAuth(c);
+    if (!ctx) return error;
+    const project = await resolveProject(ctx);
+    if (!project) return c.json({ devices: [] });
+    return c.json({ devices: await store.listDevices(project.id) });
+  });
+
+  app.post("/v1/devices/:id/heartbeat", async (c) => {
+    const { ctx, error } = await requireAuth(c);
+    if (!ctx) return error;
+    const device = await store.getDevice(c.req.param("id"));
+    if (!device) return c.json({ error: "not found" }, 404);
+    const project = await resolveProject(ctx);
+    if (!project || project.id !== device.projectId) return c.json({ error: "not found" }, 404);
+    const body = (await c.req.json().catch(() => ({}))) as { status?: "online" | "offline" };
+    const updated = await store.heartbeatDevice(device.id, body.status === "offline" ? "offline" : "online");
+    return c.json({ device: updated });
+  });
+
+  app.post("/v1/devices/:id/claim", async (c) => {
+    const { ctx, error } = await requireAuth(c);
+    if (!ctx) return error;
+    const device = await store.getDevice(c.req.param("id"));
+    if (!device) return c.json({ error: "not found" }, 404);
+    const project = await resolveProject(ctx);
+    if (!project || project.id !== device.projectId) return c.json({ error: "not found" }, 404);
+    const job = await store.claimDeviceJob(device.id);
+    return c.json({ job: job ?? null });
+  });
+
+  app.post("/v1/device-jobs", async (c) => {
+    const { ctx, error } = await requireAuth(c);
+    if (!ctx) return error;
+    const project = await resolveProject(ctx);
+    if (!project) return c.json({ error: "no project" }, 400);
+    const body = (await c.req.json()) as { objective?: string; envUrl?: string; flowId?: string };
+    let objective = body.objective;
+    if (!objective && body.flowId) {
+      const flow = (await store.listFlows(project.id)).find((f) => f.id === body.flowId);
+      objective = flow?.objective;
+    }
+    if (!objective) return c.json({ error: "objective or flowId required" }, 400);
+    const job = await store.queueDeviceJob({
+      id: newId("job"),
+      projectId: project.id,
+      objective,
+      envUrl: body.envUrl,
+      status: "queued",
+      createdAt: new Date().toISOString(),
+    });
+    return c.json({ job });
+  });
+
+  app.get("/v1/device-jobs", async (c) => {
+    const { ctx, error } = await requireAuth(c);
+    if (!ctx) return error;
+    const project = await resolveProject(ctx);
+    if (!project) return c.json({ jobs: [] });
+    return c.json({ jobs: await store.listDeviceJobs(project.id) });
+  });
+
+  app.post("/v1/device-jobs/:id/complete", async (c) => {
+    const { ctx, error } = await requireAuth(c);
+    if (!ctx) return error;
+    const project = await resolveProject(ctx);
+    if (!project) return c.json({ error: "no project" }, 400);
+    const jobs = await store.listDeviceJobs(project.id);
+    const job = jobs.find((j) => j.id === c.req.param("id"));
+    if (!job) return c.json({ error: "not found" }, 404);
+    const body = (await c.req.json().catch(() => ({}))) as { runId?: string };
+    const updated = await store.completeDeviceJob(job.id, body.runId ?? "");
+    return c.json({ job: updated });
   });
 
   app.get("/v1/alerts", async (c) => {
@@ -613,13 +873,13 @@ export function createApp(deps?: Partial<AppDeps>) {
     if (!ctx) return error;
     const project = await resolveProject(ctx);
     if (!project) return c.json({ error: "no project" }, 400);
-    const body = (await c.req.json()) as { endpoint?: string; scenarios?: number };
+    const body = (await c.req.json()) as { endpoint?: string; scenarios?: number; mode?: "text" | "voice" };
     if (!body.endpoint) return c.json({ error: "endpoint required" }, 400);
     if (body.scenarios !== undefined && (!Number.isFinite(body.scenarios) || body.scenarios < 1 || body.scenarios > 60)) {
       return c.json({ error: "scenarios must be 1-60" }, 400);
     }
     try {
-      const report = await runAgentTest({ endpoint: body.endpoint, scenarios: body.scenarios });
+      const report = await runAgentTest({ endpoint: body.endpoint, scenarios: body.scenarios, mode: body.mode });
       const runId = report.runId;
       await store.upsertRun({
         id: runId,
@@ -662,6 +922,50 @@ export function createApp(deps?: Partial<AppDeps>) {
       return c.json({ report, runId });
     } catch (err) {
       return c.json({ error: err instanceof Error ? err.message : "agent test failed" }, 502);
+    }
+  });
+
+  // Red-team eval: prompt-injection / jailbreak / PII-leak attack bank.
+  // Ingested as a first-class run like agent tests (red verdict = failed).
+  app.post("/v1/redteam", async (c) => {
+    const { ctx, error } = await requireAuth(c);
+    if (!ctx) return error;
+    const project = await resolveProject(ctx);
+    if (!project) return c.json({ error: "no project" }, 400);
+    const body = (await c.req.json()) as { endpoint?: string; category?: "injection" | "jailbreak" | "pii" | "phishing" };
+    if (!body.endpoint) return c.json({ error: "endpoint required" }, 400);
+    try {
+      const report = await runRedTeam({ endpoint: body.endpoint, category: body.category });
+      const runId = report.runId;
+      await store.upsertRun({
+        id: runId,
+        projectId: project.id,
+        objective: `redteam ${body.endpoint}${body.category ? ` (${body.category})` : ""} (${report.turns.length} probes)`,
+        status: report.verdict === "red" ? "failed" : report.verdict === "yellow" ? "paused" : "passed",
+        startedAt: new Date().toISOString(),
+        stepCount: report.turns.length,
+        error: report.verdict === "red" ? "redteam verdict red" : undefined,
+        events: report.turns.map((t, i) => ({
+          ts: new Date().toISOString(),
+          type: "decide",
+          runId,
+          stepIndex: i,
+          payload: { action: { type: "finish", success: t.pass, reason: `${t.scenarioId} -> ${t.pass ? "refused" : "leaked"}` }, reply: t.reply.slice(0, 200) },
+        })),
+      });
+      await store.replaceSpans(runId, report.spans);
+      await store.addUsage({
+        id: newId("use"),
+        projectId: project.id,
+        runId,
+        kind: "run",
+        amount: 1,
+        unit: "run",
+        createdAt: new Date().toISOString(),
+      });
+      return c.json({ report, runId });
+    } catch (err) {
+      return c.json({ error: err instanceof Error ? err.message : "redteam failed" }, 502);
     }
   });
 

@@ -14,6 +14,7 @@ const appLinks = [
   ["/projects", "Projects"],
   ["/usage", "Usage"],
   ["/alerts", "Alerts"],
+  ["/devices", "Devices"],
   ["/settings", "Settings"],
 ] as const;
 

@@ -1,7 +1,7 @@
 import pg from "pg";
 import type { BillingTier } from "@veriflow/schema";
-import { newId, type AlertRuleRow, type ApiKeyRow, type FlowRow, type HumanPauseRow, type MetricRollupRow, type ProjectRow, type RunRow, type SpanRow, type StepRow, type UsageRow, type UserProgressRow, type UserRow } from "./auth.js";
-import type { CloudStore } from "./store.js";
+import { newId, type AlertRuleRow, type ApiKeyRow, type DeviceJobRow, type DeviceRow, type FlowRow, type HumanPauseRow, type MetricRollupRow, type ProjectRow, type RunRow, type SpanRow, type StepRow, type UsageRow, type UserProgressRow, type UserRow } from "./auth.js";
+import { SESSION_TTL_MS, type CloudStore } from "./store.js";
 
 const DDL = `
 CREATE TABLE IF NOT EXISTS users (
@@ -78,8 +78,12 @@ CREATE TABLE IF NOT EXISTS flows (
   project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
   name TEXT NOT NULL,
   objective TEXT NOT NULL,
-  env_url TEXT
+  env_url TEXT,
+  schedule TEXT,
+  last_scheduled_at TEXT
 );
+ALTER TABLE flows ADD COLUMN IF NOT EXISTS schedule TEXT;
+ALTER TABLE flows ADD COLUMN IF NOT EXISTS last_scheduled_at TEXT;
 CREATE TABLE IF NOT EXISTS alert_rules (
   id TEXT PRIMARY KEY,
   project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -115,6 +119,25 @@ CREATE TABLE IF NOT EXISTS metric_rollups (
   human_intervention_rate DOUBLE PRECISION NOT NULL,
   guard_abort_rate DOUBLE PRECISION NOT NULL
 );
+CREATE TABLE IF NOT EXISTS devices (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'offline',
+  last_heartbeat_at TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS device_jobs (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  objective TEXT NOT NULL,
+  env_url TEXT,
+  status TEXT NOT NULL DEFAULT 'queued',
+  claimed_by TEXT,
+  claimed_at TEXT,
+  result_run_id TEXT,
+  created_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS user_progress (
   user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
   onboarding_done JSONB NOT NULL DEFAULT '[]'::jsonb,
@@ -125,6 +148,29 @@ CREATE TABLE IF NOT EXISTS user_progress (
 );
 `;
 
+function mapDevice(r: pg.QueryResultRow): DeviceRow {
+  return {
+    id: r.id,
+    projectId: r.project_id,
+    name: r.name,
+    status: r.status,
+    lastHeartbeatAt: r.last_heartbeat_at,
+    createdAt: r.created_at,
+  };
+}
+function mapDeviceJob(r: pg.QueryResultRow): DeviceJobRow {
+  return {
+    id: r.id,
+    projectId: r.project_id,
+    objective: r.objective,
+    envUrl: r.env_url ?? undefined,
+    status: r.status,
+    claimedBy: r.claimed_by ?? undefined,
+    claimedAt: r.claimed_at ?? undefined,
+    resultRunId: r.result_run_id ?? undefined,
+    createdAt: r.created_at,
+  };
+}
 function mapRollup(r: pg.QueryResultRow): MetricRollupRow {
   return {
     id: r.id,
@@ -216,7 +262,16 @@ export class PgStore implements CloudStore {
     const res = await this.pool.query(`SELECT * FROM sessions WHERE token_hash=$1`, [tokenHash]);
     const r = res.rows[0];
     if (!r) return undefined;
-    return { tokenHash: r.token_hash, userId: r.user_id, createdAt: new Date(r.created_at).toISOString() };
+    const createdAt = new Date(r.created_at).toISOString();
+    if (Date.now() - Date.parse(createdAt) > SESSION_TTL_MS) {
+      await this.pool.query(`DELETE FROM sessions WHERE token_hash=$1`, [tokenHash]);
+      return undefined;
+    }
+    return { tokenHash: r.token_hash, userId: r.user_id, createdAt };
+  }
+  async purgeExpiredSessions() {
+    const res = await this.pool.query(`DELETE FROM sessions WHERE created_at < now() - interval '30 days' RETURNING token_hash`);
+    return res.rowCount ?? 0;
   }
   async createProject(userId: string, name: string): Promise<ProjectRow> {
     const id = newId("prj");
@@ -389,9 +444,10 @@ export class PgStore implements CloudStore {
   }
   async saveFlow(row: FlowRow) {
     await this.pool.query(
-      `INSERT INTO flows (id, project_id, name, objective, env_url) VALUES ($1,$2,$3,$4,$5)
-       ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name, objective=EXCLUDED.objective, env_url=EXCLUDED.env_url`,
-      [row.id, row.projectId, row.name, row.objective, row.envUrl ?? null],
+      `INSERT INTO flows (id, project_id, name, objective, env_url, schedule, last_scheduled_at) VALUES ($1,$2,$3,$4,$5,$6,$7)
+       ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name, objective=EXCLUDED.objective, env_url=EXCLUDED.env_url,
+         schedule=EXCLUDED.schedule, last_scheduled_at=EXCLUDED.last_scheduled_at`,
+      [row.id, row.projectId, row.name, row.objective, row.envUrl ?? null, row.schedule ?? null, row.lastScheduledAt ?? null],
     );
     return row;
   }
@@ -403,6 +459,8 @@ export class PgStore implements CloudStore {
       name: r.name,
       objective: r.objective,
       envUrl: r.env_url ?? undefined,
+      schedule: r.schedule ?? undefined,
+      lastScheduledAt: r.last_scheduled_at ?? undefined,
     }));
   }
   async listAllRuns() {
@@ -509,6 +567,33 @@ export class PgStore implements CloudStore {
       updatedAt: new Date(r.updated_at).toISOString(),
     };
   }
+  async claimDueFlows(projectId: string, now: Date) {
+    const res = await this.pool.query(
+      `UPDATE flows SET last_scheduled_at = $2
+       WHERE project_id = $1 AND schedule IS NOT NULL AND schedule <> ''
+         AND (last_scheduled_at IS NULL OR last_scheduled_at <> $2)
+       RETURNING id, name, objective, env_url, schedule`,
+      [projectId, now.toISOString()],
+    );
+    // Cron filtering happens in-process: the claim is per-minute idempotent,
+    // which is what an external scheduler polling every minute needs.
+    const { cronMatches, parseCron } = await import("@veriflow/harness");
+    return res.rows
+      .filter((r) => {
+        try {
+          return cronMatches(parseCron(r.schedule as string), now);
+        } catch {
+          return false;
+        }
+      })
+      .map((r) => ({
+        flowId: r.id as string,
+        name: r.name as string,
+        objective: r.objective as string,
+        envUrl: (r.env_url ?? undefined) as string | undefined,
+        schedule: r.schedule as string,
+      }));
+  }
   async saveUserProgress(row: UserProgressRow): Promise<UserProgressRow> {
     await this.pool.query(
       `INSERT INTO user_progress (user_id, onboarding_done, onboarding_dismissed, tour_step, tour_mode, updated_at)
@@ -526,6 +611,61 @@ export class PgStore implements CloudStore {
   async deleteUserProgress(userId: string): Promise<boolean> {
     const res = await this.pool.query(`DELETE FROM user_progress WHERE user_id=$1`, [userId]);
     return (res.rowCount ?? 0) > 0;
+  }
+
+  // Hosted device cloud.
+  async saveDevice(row: DeviceRow): Promise<DeviceRow> {
+    await this.pool.query(
+      `INSERT INTO devices (id, project_id, name, status, last_heartbeat_at, created_at) VALUES ($1,$2,$3,$4,$5,$6)
+       ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name, status=EXCLUDED.status, last_heartbeat_at=EXCLUDED.last_heartbeat_at`,
+      [row.id, row.projectId, row.name, row.status, row.lastHeartbeatAt, row.createdAt],
+    );
+    return row;
+  }
+  async listDevices(projectId: string): Promise<DeviceRow[]> {
+    const res = await this.pool.query(`SELECT * FROM devices WHERE project_id=$1 ORDER BY created_at`, [projectId]);
+    return res.rows.map(mapDevice);
+  }
+  async getDevice(id: string): Promise<DeviceRow | undefined> {
+    const res = await this.pool.query(`SELECT * FROM devices WHERE id=$1`, [id]);
+    return res.rows[0] ? mapDevice(res.rows[0]) : undefined;
+  }
+  async heartbeatDevice(id: string, status: "online" | "offline"): Promise<DeviceRow | undefined> {
+    const res = await this.pool.query(
+      `UPDATE devices SET status=$2, last_heartbeat_at=$3 WHERE id=$1 RETURNING *`,
+      [id, status, new Date().toISOString()],
+    );
+    return res.rows[0] ? mapDevice(res.rows[0]) : undefined;
+  }
+  async queueDeviceJob(row: DeviceJobRow): Promise<DeviceJobRow> {
+    await this.pool.query(
+      `INSERT INTO device_jobs (id, project_id, objective, env_url, status, created_at) VALUES ($1,$2,$3,$4,$5,$6)`,
+      [row.id, row.projectId, row.objective, row.envUrl ?? null, row.status, row.createdAt],
+    );
+    return row;
+  }
+  async listDeviceJobs(projectId: string): Promise<DeviceJobRow[]> {
+    const res = await this.pool.query(`SELECT * FROM device_jobs WHERE project_id=$1 ORDER BY created_at`, [projectId]);
+    return res.rows.map(mapDeviceJob);
+  }
+  async claimDeviceJob(deviceId: string): Promise<DeviceJobRow | undefined> {
+    const device = await this.getDevice(deviceId);
+    if (!device) return undefined;
+    await this.heartbeatDevice(deviceId, "online");
+    const res = await this.pool.query(
+      `UPDATE device_jobs SET status='claimed', claimed_by=$2, claimed_at=$3
+       WHERE id = (SELECT id FROM device_jobs WHERE project_id=$1 AND status='queued' ORDER BY created_at LIMIT 1)
+       RETURNING *`,
+      [device.projectId, deviceId, new Date().toISOString()],
+    );
+    return res.rows[0] ? mapDeviceJob(res.rows[0]) : undefined;
+  }
+  async completeDeviceJob(id: string, resultRunId: string): Promise<DeviceJobRow | undefined> {
+    const res = await this.pool.query(
+      `UPDATE device_jobs SET status='done', result_run_id=$2 WHERE id=$1 RETURNING *`,
+      [id, resultRunId],
+    );
+    return res.rows[0] ? mapDeviceJob(res.rows[0]) : undefined;
   }
   async clearProjectData(projectId: string) {
     // Collect the run ids first so steps/spans (keyed by run, not project) go too.

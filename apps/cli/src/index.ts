@@ -11,9 +11,12 @@ import {
   replayLive,
   runAgentTest,
   runHarness,
+  runRedTeam,
   runReliability,
+  runSuite,
   syncRunIfConfigured,
 } from "@veriflow/harness";
+import type { SuiteResult } from "@veriflow/harness";
 import {
   computeLocalFlowMetrics,
   loadConfig,
@@ -33,6 +36,24 @@ const program = new Command()
   .name("veriflow")
   .description("Veriflow — local-first vision browser testing")
   .version("0.2.0");
+
+function suiteSummary(suite: SuiteResult) {
+  return {
+    total: suite.total,
+    passed: suite.passed,
+    failed: suite.failed,
+    durationMs: suite.durationMs,
+    concurrency: suite.concurrency,
+    results: suite.results.map((r: SuiteResult["results"][number]) => ({
+      name: r.name,
+      flowId: r.flowId,
+      status: r.result?.status ?? "error",
+      runId: r.result?.runId,
+      error: r.error,
+      durationMs: r.durationMs,
+    })),
+  };
+}
 
 program
   .command("run")
@@ -292,10 +313,18 @@ program
 
 program
   .command("redteam")
-  .description("Reserved — not a security suite. Use agent-test for chat evaluation.")
-  .action(() => {
-    console.error("redteam is reserved and is not a full security suite. Use `veriflow agent-test`.");
-    process.exitCode = 1;
+  .description("Prompt-injection / jailbreak / PII-leak red-team eval for chat endpoints")
+  .requiredOption("--endpoint <url>", "Chat HTTP endpoint (POST { messages })")
+  .option("--category <name>", "Limit to one category (injection|jailbreak|pii|phishing)")
+  .action(async (opts: { endpoint: string; category?: string }) => {
+    try {
+      const report = await runRedTeam({ endpoint: opts.endpoint, category: opts.category as never });
+      console.log(JSON.stringify(report, null, 2));
+      process.exitCode = report.verdict === "red" ? 1 : 0;
+    } catch (err) {
+      console.error(err instanceof Error ? err.message : err);
+      process.exitCode = 1;
+    }
   });
 
 program
@@ -303,11 +332,13 @@ program
   .description("Chat-only agent evaluation (OBSERVE/DECIDE/GUARD/ACT/VERIFY)")
   .requiredOption("--endpoint <url>", "Chat HTTP endpoint (POST { messages })")
   .option("--scenarios <n>", "How many bundled scenarios to run", "5")
-  .action(async (opts: { endpoint: string; scenarios?: string }) => {
+  .option("--mode <mode>", "text (default) or voice (telephony-style latency gates)", "text")
+  .action(async (opts: { endpoint: string; scenarios?: string; mode?: string }) => {
     try {
       const report = await runAgentTest({
         endpoint: opts.endpoint,
         scenarios: Number(opts.scenarios ?? 5),
+        mode: opts.mode === "voice" ? "voice" : "text",
       });
       console.log(JSON.stringify(report, null, 2));
       process.exitCode = report.verdict === "red" ? 1 : 0;
@@ -435,6 +466,106 @@ program
       }
     }
     console.log(JSON.stringify({ local, cloud }, null, 2));
+  });
+
+const scheduleCmd = program
+  .command("schedules")
+  .description("Cron-scheduled flow runs (poll the due-claim endpoint from cron/CI)");
+scheduleCmd
+  .command("due")
+  .description("Claim all due scheduled flows — run me every minute from cron/GitHub Actions")
+  .option("--execute", "Actually run each due flow (parallel, --concurrency)", false)
+  .option("--concurrency <n>", "Browsers in flight when --execute", "4")
+  .action(async (opts: { execute?: boolean; concurrency?: string }) => {
+    try {
+      const client = CloudClient.fromEnvOrStore();
+      if (!client) throw new Error("credentials required (veriflow login or VERIFLOW_API_KEY)");
+      const res = await client.request<{
+        due: { flowId: string; name: string; objective: string; envUrl?: string }[];
+      }>("POST", "/v1/schedules/claim", {});
+      if (!opts.execute) {
+        console.log(JSON.stringify(res, null, 2));
+        return;
+      }
+      const flows = res.due.map((f) => ({ flowId: f.flowId, name: f.name, objective: f.objective, envUrl: f.envUrl }));
+      if (!flows.length) {
+        console.log(JSON.stringify({ due: 0, ran: 0 }, null, 2));
+        return;
+      }
+      const suite = await runSuite(flows, { concurrency: Number(opts.concurrency ?? 4), headless: true });
+      console.log(JSON.stringify({ due: flows.length, ...suiteSummary(suite) }, null, 2));
+      process.exitCode = suite.failed > 0 ? 1 : 0;
+    } catch (err) {
+      console.error(err instanceof Error ? err.message : err);
+      process.exitCode = 1;
+    }
+  });
+
+program
+  .command("suite")
+  .description("Run many flows concurrently with a bounded worker pool")
+  .option("--flow <id...>", "Local flow ids to run")
+  .option("--all", "Run every saved local flow", false)
+  .option("--concurrency <n>", "Browsers in flight", "4")
+  .option("--headless", "Run headless (default true)", true)
+  .action(async (opts: { flow?: string[]; all?: boolean; concurrency?: string; headless?: boolean }) => {
+    const all = listFlows();
+    let chosen = all;
+    if (opts.flow?.length) chosen = all.filter((f) => opts.flow!.includes(f.id));
+    if (!chosen.length) {
+      console.error("no flows matched (save one with `veriflow run ... --save-flow <name>`, or pass --flow <id>)");
+      process.exitCode = 1;
+      return;
+    }
+    const suite = await runSuite(
+      chosen.map((f) => ({ flowId: f.id, name: f.name, objective: f.objective, envUrl: f.envUrl })),
+      { concurrency: Number(opts.concurrency ?? 4), headless: opts.headless !== false },
+    );
+    console.log(JSON.stringify(suiteSummary(suite), null, 2));
+    process.exitCode = suite.failed > 0 ? 1 : 0;
+  });
+
+const deviceCmd = program
+  .command("device")
+  .description("Turn this machine into a hosted-device worker (runs claimed flows)()");
+deviceCmd
+  .command("connect")
+  .description("Register this device and poll for work until interrupted")
+  .option("--name <name>", "Device label", `device-${process.pid}`)
+  .option("--poll <ms>", "Poll interval", "15000")
+  .action(async (opts: { name?: string; poll?: string }) => {
+    const client = CloudClient.fromEnvOrStore();
+    if (!client) {
+      console.error("credentials required (veriflow login or VERIFLOW_API_KEY)");
+      process.exitCode = 1;
+      return;
+    }
+    const reg = await client.request<{ device: { id: string } }>("POST", "/v1/devices", { name: opts.name });
+    console.log(`device registered: ${reg.device.id} (polling every ${opts.poll}ms — Ctrl+C to stop)`);
+    const pollMs = Number(opts.poll ?? 15000);
+    const stop = () => {
+      void client.request("POST", `/v1/devices/${reg.device.id}/heartbeat`, { status: "offline" }).catch(() => {});
+      process.exit(0);
+    };
+    process.on("SIGINT", stop);
+    for (;;) {
+      try {
+        await client.request("POST", `/v1/devices/${reg.device.id}/heartbeat`, { status: "online" });
+        const claim = await client.request<{ job?: { flowId: string; objective: string; envUrl?: string } | null }>(
+          "POST",
+          `/v1/devices/${reg.device.id}/claim`,
+          {},
+        );
+        if (claim.job) {
+          console.log(`→ job: ${claim.job.objective.slice(0, 60)}`);
+          const result = await runHarness({ objective: claim.job.objective, envUrl: claim.job.envUrl, headless: true });
+          console.log(`  done: ${result.status}`);
+        }
+      } catch (err) {
+        console.error(err instanceof Error ? err.message : err);
+      }
+      await new Promise((r) => setTimeout(r, pollMs));
+    }
   });
 
 const pauseCmd = program

@@ -1,4 +1,5 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { cronMatches, parseCron } from "@veriflow/harness";
 import { join } from "node:path";
 import { TIER_QUOTAS, type BillingTier } from "@veriflow/schema";
 import {
@@ -6,6 +7,8 @@ import {
   newId,
   type AlertRuleRow,
   type ApiKeyRow,
+  type DeviceJobRow,
+  type DeviceRow,
   type FlowRow,
   type HumanPauseRow,
   type MetricRollupRow,
@@ -26,6 +29,8 @@ export interface CloudStore {
   setTier(userId: string, tier: BillingTier): Promise<UserRow | undefined>;
   createSession(userId: string, tokenHash: string): Promise<void>;
   getSession(tokenHash: string): Promise<SessionRow | undefined>;
+  /** Remove sessions older than the TTL; returns how many were purged. */
+  purgeExpiredSessions(): Promise<number>;
   createProject(userId: string, name: string): Promise<ProjectRow>;
   listProjects(userId: string): Promise<ProjectRow[]>;
   getProject(id: string): Promise<ProjectRow | undefined>;
@@ -44,6 +49,9 @@ export interface CloudStore {
   monthlyRunCount(projectId: string, monthStartIso: string): Promise<number>;
   saveFlow(row: FlowRow): Promise<FlowRow>;
   listFlows(projectId: string): Promise<FlowRow[]>;
+  /** Scheduling: claim all flows whose cron is due — atomically per flow.
+   *  Returns (flowId, name, objective, envUrl) for the scheduler to execute. */
+  claimDueFlows(projectId: string, now: Date): Promise<{ flowId: string; name: string; objective: string; envUrl?: string; schedule: string }[]>;
   listAllRuns(): Promise<RunRow[]>;
   saveAlertRule(rule: AlertRuleRow): Promise<AlertRuleRow>;
   listAlertRules(projectId: string): Promise<AlertRuleRow[]>;
@@ -59,6 +67,16 @@ export interface CloudStore {
   saveUserProgress(row: UserProgressRow): Promise<UserProgressRow>;
   deleteUserProgress(userId: string): Promise<boolean>;
   listAllUserProgress(): Promise<UserProgressRow[]>;
+  // Hosted device cloud.
+  saveDevice(row: DeviceRow): Promise<DeviceRow>;
+  listDevices(projectId: string): Promise<DeviceRow[]>;
+  getDevice(id: string): Promise<DeviceRow | undefined>;
+  heartbeatDevice(id: string, status: "online" | "offline"): Promise<DeviceRow | undefined>;
+  queueDeviceJob(row: DeviceJobRow): Promise<DeviceJobRow>;
+  listDeviceJobs(projectId: string): Promise<DeviceJobRow[]>;
+  /** FIFO claim for a device; also flips device status online. */
+  claimDeviceJob(deviceId: string): Promise<DeviceJobRow | undefined>;
+  completeDeviceJob(id: string, resultRunId: string): Promise<DeviceJobRow | undefined>;
   /** Demo reset: drop every run/step/span/flow/rule/ledger row for a project.
    *  Returns the counts removed so the response can show what was cleared. */
   clearProjectData(projectId: string): Promise<{ runs: number; flows: number; alertRules: number; usage: number }>;
@@ -78,6 +96,8 @@ interface FileDb {
   humanPauses: HumanPauseRow[];
   metricRollups: MetricRollupRow[];
   userProgress: UserProgressRow[];
+  devices: DeviceRow[];
+  deviceJobs: DeviceJobRow[];
 }
 
 function emptyDb(): FileDb {
@@ -95,6 +115,8 @@ function emptyDb(): FileDb {
     humanPauses: [],
     metricRollups: [],
     userProgress: [],
+    devices: [],
+    deviceJobs: [],
   };
 }
 
@@ -154,7 +176,23 @@ export class MemoryStore implements CloudStore {
     this.touch();
   }
   async getSession(tokenHash: string) {
-    return this.db.sessions.find((s) => s.tokenHash === tokenHash);
+    const session = this.db.sessions.find((s) => s.tokenHash === tokenHash);
+    if (!session) return undefined;
+    // Expiry: 30 days sliding window from creation.
+    if (Date.now() - Date.parse(session.createdAt) > SESSION_TTL_MS) {
+      this.db.sessions = this.db.sessions.filter((s) => s.tokenHash !== tokenHash);
+      this.touch();
+      return undefined;
+    }
+    return session;
+  }
+  /** Purge expired sessions (call opportunistically); returns count removed. */
+  async purgeExpiredSessions() {
+    const before = this.db.sessions.length;
+    this.db.sessions = this.db.sessions.filter((s) => Date.now() - Date.parse(s.createdAt) <= SESSION_TTL_MS);
+    const removed = before - this.db.sessions.length;
+    if (removed > 0) this.touch();
+    return removed;
   }
   async createProject(userId: string, name: string) {
     const row: ProjectRow = { id: newId("prj"), userId, name, createdAt: new Date().toISOString() };
@@ -227,6 +265,78 @@ export class MemoryStore implements CloudStore {
   }
   async listFlows(projectId: string) {
     return this.db.flows.filter((f) => f.projectId === projectId);
+  }
+  async claimDueFlows(projectId: string, now: Date) {
+    const due: { flowId: string; name: string; objective: string; envUrl?: string; schedule: string }[] = [];
+    for (const flow of this.db.flows) {
+      if (flow.projectId !== projectId || !flow.schedule) continue;
+      let matches = false;
+      try {
+        matches = cronMatches(parseCron(flow.schedule), now);
+      } catch {
+        continue; // invalid stored expression — skip, never crash the scheduler
+      }
+      if (!matches) continue;
+      // Claim once per matching minute.
+      if (flow.lastScheduledAt === now.toISOString()) continue;
+      flow.lastScheduledAt = now.toISOString();
+      due.push({ flowId: flow.id, name: flow.name, objective: flow.objective, envUrl: flow.envUrl, schedule: flow.schedule });
+    }
+    this.touch();
+    return due;
+  }
+  async saveDevice(row: DeviceRow) {
+    const i = this.db.devices.findIndex((d) => d.id === row.id);
+    if (i >= 0) this.db.devices[i] = row;
+    else this.db.devices.push(row);
+    this.touch();
+    return row;
+  }
+  async listDevices(projectId: string) {
+    return this.db.devices.filter((d) => d.projectId === projectId);
+  }
+  async getDevice(id: string) {
+    return this.db.devices.find((d) => d.id === id);
+  }
+  async heartbeatDevice(id: string, status: "online" | "offline") {
+    const d = this.db.devices.find((x) => x.id === id);
+    if (!d) return undefined;
+    d.status = status;
+    d.lastHeartbeatAt = new Date().toISOString();
+    this.touch();
+    return d;
+  }
+  async queueDeviceJob(row: DeviceJobRow) {
+    this.db.deviceJobs.push(row);
+    this.touch();
+    return row;
+  }
+  async listDeviceJobs(projectId: string) {
+    return this.db.deviceJobs.filter((j) => j.projectId === projectId);
+  }
+  async claimDeviceJob(deviceId: string) {
+    const device = this.db.devices.find((d) => d.id === deviceId);
+    if (!device) return undefined;
+    device.status = "online";
+    device.lastHeartbeatAt = new Date().toISOString();
+    const job = this.db.deviceJobs.find((j) => j.projectId === device.projectId && j.status === "queued");
+    if (!job) {
+      this.touch();
+      return undefined;
+    }
+    job.status = "claimed";
+    job.claimedBy = deviceId;
+    job.claimedAt = new Date().toISOString();
+    this.touch();
+    return job;
+  }
+  async completeDeviceJob(id: string, resultRunId: string) {
+    const job = this.db.deviceJobs.find((j) => j.id === id);
+    if (!job) return undefined;
+    job.status = "done";
+    job.resultRunId = resultRunId;
+    this.touch();
+    return job;
   }
   async listAllRuns() {
     return this.db.runs;
@@ -331,6 +441,28 @@ export class MemoryStore implements CloudStore {
 }
 
 export const QUOTAS = TIER_QUOTAS;
+
+/** Session lifetime: 30 days. `getSession` enforces it lazily;
+ *  `purgeExpiredSessions` reclaims the rows. */
+export const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+
+/** Fixed-window rate limiter (in-memory, per key). */
+const rateWindows = new Map<string, { count: number; resetAt: number }>();
+export function rateLimit(key: string, limit: number, windowMs: number): { ok: boolean; retryAfter: number } {
+  const now = Date.now();
+  const w = rateWindows.get(key);
+  if (!w || w.resetAt <= now) {
+    rateWindows.set(key, { count: 1, resetAt: now + windowMs });
+    return { ok: true, retryAfter: 0 };
+  }
+  w.count++;
+  if (w.count > limit) return { ok: false, retryAfter: Math.ceil((w.resetAt - now) / 1000) };
+  return { ok: true, retryAfter: 0 };
+}
+/** Test hook: clear all rate-limit windows. */
+export function resetRateLimits() {
+  rateWindows.clear();
+}
 
 export function monthStartIso(now = new Date()): string {
   return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)).toISOString();

@@ -153,6 +153,8 @@ export const FlowSchema = z.object({
   name: z.string(),
   objective: z.string(),
   envUrl: z.string().optional(),
+  /** 5-field cron expression (local time); absent = manual runs only. */
+  schedule: z.string().optional(),
 });
 export type Flow = z.infer<typeof FlowSchema>;
 

@@ -7,7 +7,7 @@ import { api } from "@/lib/api";
 import { AppPage } from "@/components/app-page";
 import { markAction } from "@/lib/onboarding";
 
-type Flow = { id: string; name: string; objective: string; envUrl?: string };
+type Flow = { id: string; name: string; objective: string; envUrl?: string; schedule?: string };
 type Run = { id: string; flowId?: string; status: string; startedAt: string };
 type Rollup = {
   flowId: string;
@@ -30,6 +30,7 @@ export default function FlowsPage() {
   const [name, setName] = useState("");
   const [objective, setObjective] = useState("");
   const [envUrl, setEnvUrl] = useState("");
+  const [schedule, setSchedule] = useState("");
   const [note, setNote] = useState<string | null>(null);
 
   function load() {
@@ -67,9 +68,14 @@ export default function FlowsPage() {
     try {
       await api("/v1/flows", {
         method: "POST",
-        body: JSON.stringify({ name: name.trim() || objective.slice(0, 60), objective, envUrl: envUrl.trim() || undefined }),
+        body: JSON.stringify({
+          name: name.trim() || objective.slice(0, 60),
+          objective,
+          envUrl: envUrl.trim() || undefined,
+          schedule: schedule.trim() || null,
+        }),
       });
-      setNote("flow saved");
+      setNote(schedule.trim() ? `flow saved (runs on schedule "${schedule.trim()}")` : "flow saved");
       markAction("create_flow");
       setName("");
       setObjective("");
@@ -138,6 +144,7 @@ export default function FlowsPage() {
               <th>Name</th>
               <th>Objective</th>
               <th>Last run</th>
+              <th>Schedule</th>
               <th></th>
             </tr>
           </thead>
@@ -157,6 +164,7 @@ export default function FlowsPage() {
                       "—"
                     )}
                   </td>
+                  <td className="font-mono text-[10px]">{f.schedule ?? "manual"}</td>
                   <td>
                     <button type="button" onClick={() => rerun(f)}>
                       Queue re-run
@@ -225,6 +233,14 @@ export default function FlowsPage() {
       <label>
         Start URL
         <input value={envUrl} onChange={(e) => setEnvUrl(e.target.value)} placeholder="https://staging.example.com" />
+      </label>
+      <label>
+        Schedule (cron, optional)
+        <input
+          value={schedule}
+          onChange={(e) => setSchedule(e.target.value)}
+          placeholder="*/30 * * * *  — every 30 minutes; 0 9 * * 1-5 — weekdays 9am"
+        />
       </label>
       <button type="button" onClick={saveFlow}>
         Save flow

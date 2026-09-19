@@ -110,6 +110,10 @@ export interface FlowRow {
   name: string;
   objective: string;
   envUrl?: string;
+  /** 5-field cron expression; absent = manual runs only. */
+  schedule?: string;
+  /** ISO timestamp of the last scheduled (claimed) run. */
+  lastScheduledAt?: string;
 }
 
 export interface AlertRuleRow {
@@ -133,6 +137,30 @@ export interface HumanPauseRow {
   createdAt: string;
   resolvedAt?: string;
   expiresAt: string;
+}
+
+/** Hosted device cloud: a registered machine (`veriflow device connect`)
+ *  that polls for queued work. */
+export interface DeviceRow {
+  id: string;
+  projectId: string;
+  name: string;
+  status: "online" | "offline";
+  lastHeartbeatAt: string;
+  createdAt: string;
+}
+
+/** A queued unit of work a device can claim (FIFO, one claimant). */
+export interface DeviceJobRow {
+  id: string;
+  projectId: string;
+  objective: string;
+  envUrl?: string;
+  status: "queued" | "claimed" | "done";
+  claimedBy?: string;
+  claimedAt?: string;
+  resultRunId?: string;
+  createdAt: string;
 }
 
 /** Per-user UI progress (onboarding checklist, guided tour) so it follows

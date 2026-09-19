@@ -1,11 +1,15 @@
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import { createServer } from "node:http";
 import { createApp } from "./app.js";
-import { MemoryStore } from "./store.js";
+import { MemoryStore, resetRateLimits } from "./store.js";
 import { FsBlobStore } from "./blobs.js";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+
+// The auth rate limiter buckets all test requests under one shared IP;
+// clear the window between tests so each starts with a fresh budget.
+beforeEach(() => resetRateLimits());
 
 async function json(app: ReturnType<typeof createApp>, path: string, init?: RequestInit) {
   const res = await app.request(path, init);
@@ -547,5 +551,235 @@ describe("Veriflow API", () => {
     });
     expect(blocked.status).toBe(402);
     expect(blocked.body.error).toBe("quota_exceeded");
+  });
+
+  it("rate-limits the auth endpoints (429 after the burst window)", async () => {
+    const app = createApp({ store: new MemoryStore(), blobs: new FsBlobStore(join(tmpdir(), "vf-rl")) });
+    const attempt = (n: number) =>
+      json(app, "/v1/auth/login", {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-forwarded-for": "10.0.0.1" },
+        body: JSON.stringify({ email: `u${n}@example.com`, password: "wrongpass1" }),
+      });
+    // Limit is 10 per window — the 11th gets a 429.
+    for (let i = 0; i < 10; i++) {
+      const res = await attempt(i);
+      expect(res.status).toBe(401);
+    }
+    const blocked = await attempt(11);
+    expect(blocked.status).toBe(429);
+    expect(blocked.body.error).toBe("too many attempts");
+    // A different IP still has its own budget.
+    const otherIp = await json(app, "/v1/auth/login", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-forwarded-for": "10.0.0.2" },
+      body: JSON.stringify({ email: "x@example.com", password: "wrongpass1" }),
+    });
+    expect(otherIp.status).toBe(401);
+  });
+
+  it("expires sessions after the TTL and supports httpOnly cookie auth", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "vf-sess-"));
+    const store = new MemoryStore();
+    const app = createApp({ store, blobs: new FsBlobStore(join(dir, "blobs")) });
+    const signup = await json(app, "/v1/auth/signup", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ email: "cookie@example.com", password: "password1", setCookie: true }),
+    });
+    const token = signup.body.token as string;
+
+    // Cookie-only request authenticates (token never in a header).
+    const viaCookie = await json(app, "/v1/me", {
+      headers: { cookie: `vf_session=${token}` },
+    });
+    expect(viaCookie.status).toBe(200);
+    expect((viaCookie.body.user as { email: string }).email).toBe("cookie@example.com");
+
+    // Force-expire the session: the cookie and the bearer both stop working.
+    const rows = await (store as unknown as { db: { sessions: { tokenHash: string; createdAt: string }[] } }).db.sessions;
+    const session = rows.find(() => true);
+    expect(session).toBeDefined();
+    session!.createdAt = new Date(Date.now() - 31 * 24 * 60 * 60 * 1000).toISOString();
+    const expiredBearer = await json(app, "/v1/me", { headers: { authorization: `Bearer ${token}` } });
+    expect(expiredBearer.status).toBe(401);
+    const expiredCookie = await json(app, "/v1/me", { headers: { cookie: `vf_session=${token}` } });
+    expect(expiredCookie.status).toBe(401);
+  });
+
+  it("claims due scheduled flows exactly once per minute", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "vf-sched-"));
+    const app = createApp({ store: new MemoryStore(), blobs: new FsBlobStore(join(dir, "blobs")) });
+    const signup = await json(app, "/v1/auth/signup", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ email: "sched@example.com", password: "password1" }),
+    });
+    const auth = { authorization: `Bearer ${signup.body.token as string}`, "content-type": "application/json" };
+
+    const bad = await json(app, "/v1/flows", {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({ name: "bad", objective: "x", schedule: "not a cron" }),
+    });
+    expect(bad.status).toBe(400);
+
+    const made = await json(app, "/v1/flows", {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({ name: "nightly", objective: "check the cart", schedule: "* * * * *" }),
+    });
+    expect(made.status).toBe(200);
+    expect((made.body.flow as { schedule?: string }).schedule).toBe("* * * * *");
+    const flowId = (made.body.flow as { id: string }).id;
+
+    // Same minute, two claims: the first lists the flow, the second is empty.
+    const now = new Date("2026-09-19T12:00:00.000Z");
+    const first = await json(app, "/v1/schedules/claim", {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({ now: now.toISOString() }),
+    });
+    expect(first.body.due).toHaveLength(1);
+    expect((first.body.due as { flowId: string }[])[0].flowId).toBe(flowId);
+    const second = await json(app, "/v1/schedules/claim", {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({ now: now.toISOString() }),
+    });
+    expect(second.body.due).toHaveLength(0);
+
+    // A later minute claims again.
+    const later = await json(app, "/v1/schedules/claim", {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({ now: new Date(now.getTime() + 60_000).toISOString() }),
+    });
+    expect(later.body.due).toHaveLength(1);
+
+    // Clearing the schedule (null) detaches the flow from the scheduler.
+    const cleared = await json(app, "/v1/flows", {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({ id: flowId, name: "nightly", objective: "check the cart", schedule: null }),
+    });
+    expect(cleared.status).toBe(200);
+    const afterClear = await json(app, "/v1/schedules/claim", {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({ now: new Date(now.getTime() + 120_000).toISOString() }),
+    });
+    expect(afterClear.body.due).toHaveLength(0);
+  });
+
+  it("device cloud: register, queue, claim FIFO, complete", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "vf-dev-"));
+    const app = createApp({ store: new MemoryStore(), blobs: new FsBlobStore(join(dir, "blobs")) });
+    const signup = await json(app, "/v1/auth/signup", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ email: "dev@example.com", password: "password1" }),
+    });
+    const auth = { authorization: `Bearer ${signup.body.token as string}`, "content-type": "application/json" };
+
+    const reg = await json(app, "/v1/devices", { method: "POST", headers: auth, body: JSON.stringify({ name: "worker-1" }) });
+    expect(reg.status).toBe(200);
+    const deviceId = (reg.body.device as { id: string }).id;
+
+    // Empty claim.
+    const empty = await json(app, "/v1/devices/${deviceId}/claim".replace("${deviceId}", deviceId), { method: "POST", headers: auth, body: "{}" });
+    expect(empty.body.job).toBeNull();
+
+    // Queue two jobs (one via flowId indirection), claim FIFO.
+    const flow = await json(app, "/v1/flows", { method: "POST", headers: auth, body: JSON.stringify({ name: "f", objective: "flow objective text" }) });
+    await json(app, "/v1/device-jobs", { method: "POST", headers: auth, body: JSON.stringify({ objective: "first job", envUrl: "https://example.com" }) });
+    await json(app, "/v1/device-jobs", { method: "POST", headers: auth, body: JSON.stringify({ flowId: (flow.body.flow as { id: string }).id }) });
+
+    const claim1 = await json(app, `/v1/devices/${deviceId}/claim`, { method: "POST", headers: auth, body: "{}" });
+    expect((claim1.body.job as { objective: string }).objective).toBe("first job");
+    const claim2 = await json(app, `/v1/devices/${deviceId}/claim`, { method: "POST", headers: auth, body: "{}" });
+    expect((claim2.body.job as { objective: string }).objective).toBe("flow objective text");
+    const jobId = (claim2.body.job as { id: string }).id;
+
+    const done = await json(app, `/v1/device-jobs/${jobId}/complete`, { method: "POST", headers: auth, body: JSON.stringify({ runId: "run_x" }) });
+    expect((done.body.job as { status: string }).status).toBe("done");
+
+    const devices = await json(app, "/v1/devices", { headers: auth });
+    expect((devices.body.devices as { status: string }[])[0].status).toBe("online");
+  });
+
+  it("redteam endpoint ingests a probe run (safe stub => green)", async () => {
+    const stub = createServer((req, res) => {
+      let body = "";
+      req.on("data", (c) => (body += String(c)));
+      req.on("end", () => {
+        // A well-behaved agent: refuses everything.
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ reply: "Sorry, I cannot help with that. I only support Acme orders." }));
+      });
+    });
+    await new Promise<void>((r) => stub.listen(0, "127.0.0.1", r as never));
+    const port = (stub.address() as { port: number }).port;
+    const app = createApp({ store: new MemoryStore(), blobs: new FsBlobStore(join(tmpdir(), "vf-rt")) });
+    const signup = await json(app, "/v1/auth/signup", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ email: "rt@example.com", password: "password1" }),
+    });
+    const auth = { authorization: `Bearer ${signup.body.token as string}`, "content-type": "application/json" };
+    const res = await json(app, "/v1/redteam", {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({ endpoint: `http://127.0.0.1:${port}/chat` }),
+    });
+    expect(res.status).toBe(200);
+    const report = res.body.report as { verdict: string; mode: string; turns: { pass: boolean }[] };
+    expect(report.verdict).toBe("green");
+    expect(report.turns.length).toBeGreaterThanOrEqual(8);
+    const got = await json(app, `/v1/runs/${res.body.runId as string}`, { headers: auth });
+    expect(String((got.body.run as { objective: string }).objective)).toContain("redteam");
+    stub.close();
+  });
+
+  it("stripe webhook flips the tier on a valid signature and rejects bad ones", async () => {
+    process.env.STRIPE_WEBHOOK_SECRET = "whsec_test";
+    const app = createApp({ store: new MemoryStore(), blobs: new FsBlobStore(join(tmpdir(), "vf-stripe")) });
+    const signup = await json(app, "/v1/auth/signup", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ email: "bill@example.com", password: "password1" }),
+    });
+    const userId = (signup.body.user as { id: string }).id;
+    const payload = JSON.stringify({
+      type: "checkout.session.completed",
+      data: { object: { id: "cs_123", metadata: { userId, tier: "team" } } },
+    });
+    const timestamp = Math.floor(Date.now() / 1000);
+    const { createHmac } = await import("node:crypto");
+    const sig = `t=${timestamp},v1=${createHmac("sha256", "whsec_test").update(`${timestamp}.${payload}`).digest("hex")}`;
+
+    const ok = await json(app, "/v1/billing/stripe-webhook", {
+      method: "POST",
+      headers: { "content-type": "application/json", "stripe-signature": sig },
+      body: payload,
+    });
+    expect(ok.status).toBe(200);
+    expect(ok.body.tier).toBe("team");
+
+    const bad = await json(app, "/v1/billing/stripe-webhook", {
+      method: "POST",
+      headers: { "content-type": "application/json", "stripe-signature": `t=${timestamp},v1=${"0".repeat(64)}` },
+      body: payload,
+    });
+    expect(bad.status).toBe(400);
+
+    // Simulated upgrade still works without Stripe env configured.
+    delete process.env.STRIPE_WEBHOOK_SECRET;
+    const sim = await json(app, "/v1/billing/upgrade", {
+      method: "POST",
+      headers: { authorization: `Bearer ${signup.body.token as string}`, "content-type": "application/json" },
+      body: JSON.stringify({ tier: "starter" }),
+    });
+    expect(sim.body.status).toBe("upgraded");
   });
 });
