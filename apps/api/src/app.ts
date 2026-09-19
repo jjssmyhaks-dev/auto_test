@@ -3,6 +3,7 @@ import { cors } from "hono/cors";
 import { TIER_QUOTAS, type BillingTier, type Span } from "@veriflow/schema";
 import { spansToOtlp } from "@veriflow/telemetry";
 import { runAgentTest } from "@veriflow/harness";
+import type { MetricRollupRow, RunRow } from "./auth.js";
 import {
   hashPassword,
   hashToken,
@@ -21,6 +22,13 @@ import { FsBlobStore } from "./blobs.js";
 export interface AppDeps {
   store: CloudStore;
   blobs: BlobStore;
+}
+
+function median(nums: number[]): number {
+  if (!nums.length) return 0;
+  const s = [...nums].sort((a, b) => a - b);
+  const mid = Math.floor(s.length / 2);
+  return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
 }
 
 function stepsFromEvents(runId: string, events: Array<{ type: string; ts: string; stepIndex?: number; payload: Record<string, unknown> }>): StepRow[] {
@@ -100,6 +108,8 @@ export function createApp(deps?: Partial<AppDeps>) {
         "/v1/human-pauses/{id}": { get: {} },
         "/v1/human-pauses/{id}/resolve": { post: {} },
         "/v1/agent-tests": { post: {} },
+        "/v1/metrics/rollups": { get: {} },
+        "/v1/metrics/rollups/refresh": { post: {} },
         "/v1/metrics/{flowId}": { get: {} },
       },
     }),
@@ -650,6 +660,70 @@ export function createApp(deps?: Partial<AppDeps>) {
     } catch (err) {
       return c.json({ error: err instanceof Error ? err.message : "agent test failed" }, 502);
     }
+  });
+
+  // Spec §4: precomputed metric rollups — refresh recomputes per-flow 7/30-day
+  // windows from stored run events; queries just read the rollup rows.
+  app.post("/v1/metrics/rollups/refresh", async (c) => {
+    const { ctx, error } = await requireAuth(c);
+    if (!ctx) return error;
+    const project = await resolveProject(ctx);
+    if (!project) return c.json({ error: "no project" }, 400);
+    const runs = await store.listRuns(project.id);
+    const now = Date.now();
+    const computedAt = new Date(now).toISOString();
+    const rollups: MetricRollupRow[] = [];
+    const byFlow = new Map<string, RunRow[]>();
+    for (const run of runs) {
+      const key = run.flowId ?? "_project";
+      byFlow.set(key, [...(byFlow.get(key) ?? []), run]);
+    }
+    for (const [flowId, flowRuns] of byFlow) {
+      for (const windowDays of [7, 30] as const) {
+        const cutoff = now - windowDays * 86_400_000;
+        const inWindow = flowRuns.filter((r) => new Date(r.startedAt).getTime() >= cutoff);
+        if (inWindow.length === 0) continue;
+        const passed = inWindow.filter((r) => r.status === "passed").length;
+        let steps = 0;
+        let retries = 0;
+        let healed = 0;
+        let human = 0;
+        let guardAborts = 0;
+        for (const run of inWindow) {
+          const events = (run.events as Array<{ type: string; payload: Record<string, unknown> }> | undefined) ?? [];
+          steps += events.filter((e) => e.type === "decide" && e.payload.action).length;
+          const runRetries = events.filter((e) => e.type === "retry");
+          retries += runRetries.length;
+          healed += runRetries.filter((e) => e.payload.ok === true).length;
+          human += events.filter((e) => e.type === "human").length;
+          guardAborts += events.filter((e) => e.type === "guard" && e.payload.ok === false).length;
+        }
+        rollups.push({
+          id: newId("roll"),
+          projectId: project.id,
+          flowId,
+          windowDays,
+          computedAt,
+          runs: inWindow.length,
+          successRate: inWindow.length ? passed / inWindow.length : 0,
+          medianSteps: median(inWindow.map((r) => r.stepCount ?? 0)),
+          avgCostUsd: inWindow.length ? inWindow.reduce((s, r) => s + (r.costUsd ?? 0), 0) / inWindow.length : 0,
+          selfHealRate: retries ? healed / retries : 0,
+          humanInterventionRate: inWindow.length ? human / inWindow.length : 0,
+          guardAbortRate: inWindow.length ? guardAborts / inWindow.length : 0,
+        });
+      }
+    }
+    await store.replaceMetricRollups(project.id, rollups);
+    return c.json({ refreshed: rollups.length, computedAt });
+  });
+
+  app.get("/v1/metrics/rollups", async (c) => {
+    const { ctx, error } = await requireAuth(c);
+    if (!ctx) return error;
+    const project = await resolveProject(ctx);
+    if (!project) return c.json({ rollups: [] });
+    return c.json({ rollups: await store.listMetricRollups(project.id, c.req.query("flowId") || undefined) });
   });
 
   app.get("/v1/metrics/:flowId", async (c) => {

@@ -8,6 +8,7 @@ import {
   type ApiKeyRow,
   type FlowRow,
   type HumanPauseRow,
+  type MetricRollupRow,
   type ProjectRow,
   type RunRow,
   type SessionRow,
@@ -51,6 +52,8 @@ export interface CloudStore {
   listHumanPauses(projectId: string): Promise<HumanPauseRow[]>;
   getHumanPause(id: string): Promise<HumanPauseRow | undefined>;
   resolveHumanPause(id: string, response: string): Promise<HumanPauseRow | undefined>;
+  replaceMetricRollups(projectId: string, rollups: MetricRollupRow[]): Promise<void>;
+  listMetricRollups(projectId: string, flowId?: string): Promise<MetricRollupRow[]>;
 }
 
 interface FileDb {
@@ -65,6 +68,7 @@ interface FileDb {
   flows: FlowRow[];
   alertRules: AlertRuleRow[];
   humanPauses: HumanPauseRow[];
+  metricRollups: MetricRollupRow[];
 }
 
 function emptyDb(): FileDb {
@@ -80,6 +84,7 @@ function emptyDb(): FileDb {
     flows: [],
     alertRules: [],
     humanPauses: [],
+    metricRollups: [],
   };
 }
 
@@ -266,6 +271,15 @@ export class MemoryStore implements CloudStore {
     pause.resolvedAt = new Date().toISOString();
     this.persist?.();
     return pause;
+  }
+  async replaceMetricRollups(projectId: string, rollups: MetricRollupRow[]) {
+    this.db.metricRollups = this.db.metricRollups.filter((r) => r.projectId !== projectId).concat(rollups);
+    this.persist?.();
+  }
+  async listMetricRollups(projectId: string, flowId?: string) {
+    return this.db.metricRollups
+      .filter((r) => r.projectId === projectId && (!flowId || r.flowId === flowId))
+      .sort((a, b) => (a.flowId < b.flowId ? -1 : a.flowId > b.flowId ? 1 : a.windowDays - b.windowDays));
   }
 }
 

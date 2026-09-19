@@ -135,6 +135,23 @@ export interface HumanPauseRow {
   expiresAt: string;
 }
 
+/** Spec §4: precomputed per-flow/project metrics so the dashboard never
+ *  scans raw spans on page load. Two windows: trailing 7 and 30 days. */
+export interface MetricRollupRow {
+  id: string;
+  projectId: string;
+  flowId: string;
+  windowDays: 7 | 30;
+  computedAt: string;
+  runs: number;
+  successRate: number;
+  medianSteps: number;
+  avgCostUsd: number;
+  selfHealRate: number;
+  humanInterventionRate: number;
+  guardAbortRate: number;
+}
+
 export interface AuthContext {
   user: UserRow;
   project?: ProjectRow;

@@ -1,6 +1,6 @@
 import pg from "pg";
 import type { BillingTier } from "@veriflow/schema";
-import { newId, type AlertRuleRow, type ApiKeyRow, type FlowRow, type HumanPauseRow, type ProjectRow, type RunRow, type SpanRow, type StepRow, type UsageRow, type UserRow } from "./auth.js";
+import { newId, type AlertRuleRow, type ApiKeyRow, type FlowRow, type HumanPauseRow, type MetricRollupRow, type ProjectRow, type RunRow, type SpanRow, type StepRow, type UsageRow, type UserRow } from "./auth.js";
 import type { CloudStore } from "./store.js";
 
 const DDL = `
@@ -101,7 +101,38 @@ CREATE TABLE IF NOT EXISTS human_pauses (
   resolved_at TIMESTAMPTZ,
   expires_at TIMESTAMPTZ NOT NULL
 );
+CREATE TABLE IF NOT EXISTS metric_rollups (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  flow_id TEXT NOT NULL,
+  window_days INT NOT NULL,
+  computed_at TIMESTAMPTZ NOT NULL,
+  runs INT NOT NULL,
+  success_rate DOUBLE PRECISION NOT NULL,
+  median_steps DOUBLE PRECISION NOT NULL,
+  avg_cost_usd DOUBLE PRECISION NOT NULL,
+  self_heal_rate DOUBLE PRECISION NOT NULL,
+  human_intervention_rate DOUBLE PRECISION NOT NULL,
+  guard_abort_rate DOUBLE PRECISION NOT NULL
+);
 `;
+
+function mapRollup(r: pg.QueryResultRow): MetricRollupRow {
+  return {
+    id: r.id,
+    projectId: r.project_id,
+    flowId: r.flow_id,
+    windowDays: r.window_days,
+    computedAt: new Date(r.computed_at).toISOString(),
+    runs: r.runs,
+    successRate: Number(r.success_rate),
+    medianSteps: Number(r.median_steps),
+    avgCostUsd: Number(r.avg_cost_usd),
+    selfHealRate: Number(r.self_heal_rate),
+    humanInterventionRate: Number(r.human_intervention_rate),
+    guardAbortRate: Number(r.guard_abort_rate),
+  };
+}
 
 function mapHumanPause(r: pg.QueryResultRow): HumanPauseRow {
   return {
@@ -425,6 +456,36 @@ export class PgStore implements CloudStore {
       [id, response],
     );
     return res.rows[0] ? mapHumanPause(res.rows[0]) : undefined;
+  }
+
+  async replaceMetricRollups(projectId: string, rollups: MetricRollupRow[]) {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query(`DELETE FROM metric_rollups WHERE project_id=$1`, [projectId]);
+      for (const r of rollups) {
+        await client.query(
+          `INSERT INTO metric_rollups
+           (id, project_id, flow_id, window_days, computed_at, runs, success_rate, median_steps,
+            avg_cost_usd, self_heal_rate, human_intervention_rate, guard_abort_rate)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+          [r.id, r.projectId, r.flowId, r.windowDays, r.computedAt, r.runs, r.successRate, r.medianSteps,
+           r.avgCostUsd, r.selfHealRate, r.humanInterventionRate, r.guardAbortRate],
+        );
+      }
+      await client.query("COMMIT");
+    } catch (err) {
+      await client.query("ROLLBACK");
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+  async listMetricRollups(projectId: string, flowId?: string) {
+    const res = flowId
+      ? await this.pool.query(`SELECT * FROM metric_rollups WHERE project_id=$1 AND flow_id=$2`, [projectId, flowId])
+      : await this.pool.query(`SELECT * FROM metric_rollups WHERE project_id=$1`, [projectId]);
+    return res.rows.map(mapRollup);
   }
 
   private mapRun(r: pg.QueryResultRow): RunRow {

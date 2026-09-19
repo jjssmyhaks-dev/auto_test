@@ -264,6 +264,89 @@ describe("Veriflow API", () => {
     stub.close();
   });
 
+  it("computes per-flow metric rollups from stored events (spec 4)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "vf-roll-"));
+    const app = createApp({ store: new MemoryStore(), blobs: new FsBlobStore(join(dir, "blobs")) });
+    const signup = await json(app, "/v1/auth/signup", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ email: "m@example.com", password: "password1" }),
+    });
+    const auth = { authorization: `Bearer ${signup.body.token as string}`, "content-type": "application/json" };
+    const ts = new Date().toISOString();
+
+    // Flow A: one passed run with a successful self-heal; one failed run with a human pause + guard abort.
+    await json(app, "/v1/runs", {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({
+        id: "run_roll_a1",
+        flowId: "flow_A",
+        objective: "ok run",
+        status: "passed",
+        stepCount: 4,
+        costUsd: 0.02,
+        events: [
+          { ts, type: "decide", stepIndex: 0, payload: { action: { type: "click", target: { ref: "@e1" } } } },
+          { ts, type: "retry", stepIndex: 0, payload: { ok: false } },
+          { ts, type: "retry", stepIndex: 0, payload: { ok: true, healed: true } },
+        ],
+      }),
+    });
+    await json(app, "/v1/runs", {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({
+        id: "run_roll_a2",
+        flowId: "flow_A",
+        objective: "blocked run",
+        status: "failed",
+        stepCount: 2,
+        costUsd: 0.04,
+        events: [
+          { ts, type: "human", stepIndex: 1, payload: { reason: "otp" } },
+          { ts, type: "guard", stepIndex: 2, payload: { ok: false, code: "loop_detected" } },
+        ],
+      }),
+    });
+    // Flow B: single passing run.
+    await json(app, "/v1/runs", {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({ id: "run_roll_b1", flowId: "flow_B", objective: "fine", status: "passed", stepCount: 1 }),
+    });
+
+    const refreshed = await json(app, "/v1/metrics/rollups/refresh", { method: "POST", headers: auth });
+    expect(refreshed.status).toBe(200);
+    expect(refreshed.body.refreshed as number).toBe(4); // 2 flows x 2 windows
+
+    const all = await json(app, "/v1/metrics/rollups", { headers: auth });
+    const rollups = all.body.rollups as Array<{
+      flowId: string;
+      windowDays: number;
+      runs: number;
+      successRate: number;
+      selfHealRate: number;
+      humanInterventionRate: number;
+      guardAbortRate: number;
+      medianSteps: number;
+      avgCostUsd: number;
+    }>;
+    const a30 = rollups.find((r) => r.flowId === "flow_A" && r.windowDays === 30)!;
+    expect(a30.runs).toBe(2);
+    expect(a30.successRate).toBeCloseTo(0.5);
+    expect(a30.selfHealRate).toBeCloseTo(0.5); // 1 of 2 retries healed
+    expect(a30.humanInterventionRate).toBeCloseTo(0.5); // 1 pause in 2 runs
+    expect(a30.guardAbortRate).toBeCloseTo(0.5);
+    expect(a30.medianSteps).toBe(3); // median of 4 and 2
+    expect(a30.avgCostUsd).toBeCloseTo(0.03);
+
+    const bOnly = await json(app, "/v1/metrics/rollups?flowId=flow_B", { headers: auth });
+    const b = (bOnly.body.rollups as Array<{ flowId: string }>);
+    expect(b.length).toBeGreaterThanOrEqual(1);
+    expect(b.every((r) => r.flowId === "flow_B")).toBe(true);
+  });
+
   it("returns 402 when monthly cloud quota is exhausted", async () => {
     const dir = mkdtempSync(join(tmpdir(), "vf-quota-"));
     class TightQuotaStore extends MemoryStore {

@@ -8,11 +8,23 @@ import { AppPage } from "@/components/app-page";
 
 type Flow = { id: string; name: string; objective: string; envUrl?: string };
 type Run = { id: string; flowId?: string; status: string; startedAt: string };
+type Rollup = {
+  flowId: string;
+  windowDays: number;
+  runs: number;
+  successRate: number;
+  medianSteps: number;
+  avgCostUsd: number;
+  selfHealRate: number;
+  humanInterventionRate: number;
+  guardAbortRate: number;
+};
 
 export default function FlowsPage() {
   const router = useRouter();
   const [flows, setFlows] = useState<Flow[] | null>(null);
   const [runs, setRuns] = useState<Run[]>([]);
+  const [rollups, setRollups] = useState<Rollup[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [name, setName] = useState("");
   const [objective, setObjective] = useState("");
@@ -26,6 +38,20 @@ export default function FlowsPage() {
     api<{ runs: Run[] }>("/v1/runs?limit=200")
       .then((r) => setRuns(r.runs))
       .catch(() => setRuns([]));
+    api<{ rollups: Rollup[] }>("/v1/metrics/rollups")
+      .then((r) => setRollups(r.rollups))
+      .catch(() => setRollups([]));
+  }
+
+  async function refreshMetrics() {
+    try {
+      await api("/v1/metrics/rollups/refresh", { method: "POST" });
+      const r = await api<{ rollups: Rollup[] }>("/v1/metrics/rollups");
+      setRollups(r.rollups);
+      setNote("metrics refreshed");
+    } catch (e) {
+      setNote(e instanceof Error ? e.message : String(e));
+    }
   }
 
   useEffect(() => {
@@ -129,6 +155,46 @@ export default function FlowsPage() {
           </tbody>
         </table>
       )}
+
+      <h2>Reliability (30-day rollups)</h2>
+      <p className="empty">
+        Precomputed per flow so the dashboard never scans raw spans. {rollups.length === 0 ? "Nothing yet — refresh to compute." : ""}
+      </p>
+      {rollups.length > 0 ? (
+        <table>
+          <thead>
+            <tr>
+              <th>Flow</th>
+              <th>Success</th>
+              <th>Self-heal</th>
+              <th>Human</th>
+              <th>Guard aborts</th>
+              <th>Steps p50</th>
+              <th>Avg cost</th>
+              <th>Runs</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rollups
+              .filter((r) => r.windowDays === 30)
+              .map((r) => (
+                <tr key={r.flowId}>
+                  <td>{r.flowId === "_project" ? "(no flow)" : r.flowId}</td>
+                  <td>{Math.round(r.successRate * 100)}%</td>
+                  <td>{Math.round(r.selfHealRate * 100)}%</td>
+                  <td>{Math.round(r.humanInterventionRate * 100)}%</td>
+                  <td>{Math.round(r.guardAbortRate * 100)}%</td>
+                  <td>{r.medianSteps}</td>
+                  <td>${r.avgCostUsd.toFixed(4)}</td>
+                  <td>{r.runs}</td>
+                </tr>
+              ))}
+          </tbody>
+        </table>
+      ) : null}
+      <button type="button" onClick={refreshMetrics}>
+        Refresh metrics
+      </button>
 
       <h2>Save a flow</h2>
       <label>
