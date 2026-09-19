@@ -13,6 +13,7 @@ type Trace = {
   steps: { index: number; action: unknown; status: string }[];
   spans: { kind: string; ok?: boolean; startedAt: string; error?: string; attributes?: Record<string, unknown> }[];
   screenshots: string[];
+  videoUrl?: string;
   capture?: { network?: { url: string; method: string; status?: number }[]; console?: { type: string; text: string }[] };
 };
 
@@ -62,6 +63,17 @@ export default function RunDetailPage() {
       <RunTraceView objective={trace.run.objective} steps={trace.steps} spans={trace.spans} />
       <h2>Scrubber</h2>
       <TraceScrubber steps={trace.steps} spans={trace.spans} screenshots={trace.screenshots} />
+      {trace.videoUrl ? (
+        <>
+          <h2>Video</h2>
+          <video controls src={trace.videoUrl} className="max-w-2xl border border-foreground/25" />
+          <p className="empty">
+            <a href={trace.videoUrl} download className="underline">
+              Download video.webm
+            </a>
+          </p>
+        </>
+      ) : null}
       <p className="mt-2 text-sm">
         <Link href={`/runs/compare?a=${trace.run.id}&b=`} className="underline">
           Compare this run against another →

@@ -12,6 +12,9 @@ export default function LoginPage() {
   const [password, setPassword] = useState("password1");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  // Invites land as /login?invite=<token> — accept it right after auth.
+  const inviteToken = typeof window !== "undefined" ? new URLSearchParams(window.location.search).get("invite") : null;
+  const [invited, setInvited] = useState<string | null>(null);
 
   async function submit(path: "/v1/auth/login" | "/v1/auth/signup", e: FormEvent) {
     e.preventDefault();
@@ -26,6 +29,18 @@ export default function LoginPage() {
       // Pull this account's onboarding/tour progress so it follows the user
       // across devices; union with anything done locally before sign-in.
       void syncOnboardingFromAccount();
+      if (inviteToken) {
+        try {
+          const acc = await api<{ projectId: string; role: string }>("/v1/invites/accept", {
+            method: "POST",
+            body: JSON.stringify({ token: inviteToken }),
+          });
+          setInvited(`Joined project ${acc.projectId} as ${acc.role}.`);
+          history.replaceState(null, "", window.location.pathname);
+        } catch (inviteErr) {
+          setInvited(inviteErr instanceof Error ? inviteErr.message : "Invite could not be accepted.");
+        }
+      }
       router.push("/runs");
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -36,6 +51,9 @@ export default function LoginPage() {
 
   return (
     <AppPage kicker="Account" title="Sign in to sync evidence.">
+      {inviteToken ? (
+        <p className="empty">You've been invited to a team project — sign in or sign up to join it.</p>
+      ) : null}
       <form className="stack">
         <label>
           Email
@@ -46,6 +64,7 @@ export default function LoginPage() {
           <input value={password} onChange={(e) => setPassword(e.target.value)} type="password" />
         </label>
         {error ? <p className="error">{error}</p> : null}
+        {invited ? <p className="empty">{invited}</p> : null}
         <div className="row">
           <button disabled={busy} onClick={(e) => submit("/v1/auth/login", e)}>
             Log in

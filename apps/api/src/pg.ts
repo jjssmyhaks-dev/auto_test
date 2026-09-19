@@ -1,6 +1,6 @@
 import pg from "pg";
 import type { BillingTier } from "@veriflow/schema";
-import { newId, type AlertRuleRow, type ApiKeyRow, type DeviceJobRow, type DeviceRow, type FlowRow, type HumanPauseRow, type MetricRollupRow, type ProjectRow, type RunRow, type SpanRow, type StepRow, type UsageRow, type UserProgressRow, type UserRow } from "./auth.js";
+import { newId, type AlertRuleRow, type ApiKeyRow, type DeviceJobRow, type DeviceRow, type FlowRow, type HumanPauseRow, type InviteRow, type MemberRow, type MetricRollupRow, type ProjectRole, type ProjectRow, type RunRow, type SpanRow, type StepRow, type UsageRow, type UserProgressRow, type UserRow } from "./auth.js";
 import { SESSION_TTL_MS, type CloudStore } from "./store.js";
 
 const DDL = `
@@ -14,6 +14,24 @@ CREATE TABLE IF NOT EXISTS users (
 CREATE TABLE IF NOT EXISTS sessions (
   token_hash TEXT PRIMARY KEY,
   user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS project_members (
+  project_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  role TEXT NOT NULL,
+  added_by TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (project_id, user_id)
+);
+CREATE TABLE IF NOT EXISTS project_invites (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL,
+  email TEXT NOT NULL,
+  role TEXT NOT NULL,
+  token TEXT UNIQUE NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  invited_by TEXT NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE TABLE IF NOT EXISTS projects (
@@ -296,6 +314,141 @@ export class PgStore implements CloudStore {
     const r = res.rows[0];
     if (!r) return undefined;
     return { id: r.id, userId: r.user_id, name: r.name, createdAt: new Date(r.created_at).toISOString() };
+  }
+  async addMember(row: MemberRow) {
+    await this.pool.query(
+      `INSERT INTO project_members (project_id, user_id, role, added_by) VALUES ($1,$2,$3,$4)
+       ON CONFLICT (project_id, user_id) DO UPDATE SET role = EXCLUDED.role, added_by = EXCLUDED.added_by`,
+      [row.projectId, row.userId, row.role, row.addedBy],
+    );
+    return row;
+  }
+  async listMembers(projectId: string) {
+    const res = await this.pool.query(
+      `SELECT m.*, u.email FROM project_members m JOIN users u ON u.id = m.user_id WHERE m.project_id=$1 ORDER BY m.created_at`,
+      [projectId],
+    );
+    return res.rows.map((r) => ({
+      projectId: r.project_id,
+      userId: r.user_id,
+      role: r.role as ProjectRole,
+      addedBy: r.added_by,
+      createdAt: new Date(r.created_at).toISOString(),
+      email: r.email,
+    }));
+  }
+  async listMemberships(userId: string) {
+    const res = await this.pool.query(`SELECT * FROM project_members WHERE user_id=$1`, [userId]);
+    return res.rows.map((r) => ({
+      projectId: r.project_id,
+      userId: r.user_id,
+      role: r.role as ProjectRole,
+      addedBy: r.added_by,
+      createdAt: new Date(r.created_at).toISOString(),
+    }));
+  }
+  async removeMember(projectId: string, userId: string) {
+    const res = await this.pool.query(`DELETE FROM project_members WHERE project_id=$1 AND user_id=$2`, [projectId, userId]);
+    return (res.rowCount ?? 0) > 0;
+  }
+  async setMemberRole(projectId: string, userId: string, role: ProjectRole) {
+    const res = await this.pool.query(
+      `UPDATE project_members SET role=$3 WHERE project_id=$1 AND user_id=$2 RETURNING *`,
+      [projectId, userId, role],
+    );
+    const r = res.rows[0];
+    if (!r) return undefined;
+    return { projectId: r.project_id, userId: r.user_id, role: r.role as ProjectRole, addedBy: r.added_by, createdAt: new Date(r.created_at).toISOString() };
+  }
+  async roleFor(projectId: string, userId: string) {
+    const res = await this.pool.query(
+      `SELECT CASE WHEN p.user_id = $2 THEN 'owner' ELSE m.role END AS role
+       FROM projects p LEFT JOIN project_members m ON m.project_id = p.id AND m.user_id = $2
+       WHERE p.id = $1`,
+      [projectId, userId],
+    );
+    return res.rows[0]?.role as ProjectRole | undefined;
+  }
+  async createInvite(row: InviteRow) {
+    await this.pool.query(
+      `INSERT INTO project_invites (id, project_id, email, role, token, status, invited_by) VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+      [row.id, row.projectId, row.email, row.role, row.token, row.status, row.invitedBy],
+    );
+    return row;
+  }
+  async listInvites(projectId: string) {
+    const res = await this.pool.query(`SELECT * FROM project_invites WHERE project_id=$1 ORDER BY created_at DESC`, [projectId]);
+    return res.rows.map((r) => ({
+      id: r.id,
+      projectId: r.project_id,
+      email: r.email,
+      role: r.role as ProjectRole,
+      token: r.token,
+      status: r.status as InviteRow["status"],
+      invitedBy: r.invited_by,
+      createdAt: new Date(r.created_at).toISOString(),
+    }));
+  }
+  async getInviteByToken(token: string) {
+    const res = await this.pool.query(`SELECT * FROM project_invites WHERE token=$1 AND status='pending'`, [token]);
+    const r = res.rows[0];
+    if (!r) return undefined;
+    return {
+      id: r.id,
+      projectId: r.project_id,
+      email: r.email,
+      role: r.role as ProjectRole,
+      token: r.token,
+      status: r.status as InviteRow["status"],
+      invitedBy: r.invited_by,
+      createdAt: new Date(r.created_at).toISOString(),
+    };
+  }
+  async acceptInvite(token: string, userId: string) {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const inv = await client.query(`SELECT * FROM project_invites WHERE token=$1 AND status='pending' FOR UPDATE`, [token]);
+      const r = inv.rows[0];
+      if (!r) {
+        await client.query("COMMIT");
+        return undefined;
+      }
+      await client.query(`UPDATE project_invites SET status='accepted' WHERE id=$1`, [r.id]);
+      await client.query(
+        `INSERT INTO project_members (project_id, user_id, role, added_by) VALUES ($1,$2,$3,$4)
+         ON CONFLICT (project_id, user_id) DO UPDATE SET role = EXCLUDED.role`,
+        [r.project_id, userId, r.role, r.invited_by],
+      );
+      await client.query("COMMIT");
+      const invite: InviteRow = {
+        id: r.id,
+        projectId: r.project_id,
+        email: r.email,
+        role: r.role as ProjectRole,
+        token: r.token,
+        status: "accepted",
+        invitedBy: r.invited_by,
+        createdAt: new Date(r.created_at).toISOString(),
+      };
+      const member: MemberRow = { projectId: r.project_id, userId, role: r.role as ProjectRole, addedBy: r.invited_by, createdAt: new Date().toISOString() };
+      return { invite, member };
+    } catch (err) {
+      await client.query("ROLLBACK").catch(() => {});
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+  async revokeInvite(projectId: string, inviteId: string) {
+    const res = await this.pool.query(`UPDATE project_invites SET status='revoked' WHERE id=$1 AND project_id=$2`, [inviteId, projectId]);
+    return (res.rowCount ?? 0) > 0;
+  }
+  async findUserByEmail(email: string) {
+    const res = await this.pool.query(`SELECT * FROM users WHERE lower(email)=lower($1)`, [email.trim()]);
+    const r = res.rows[0];
+ if (!r) return undefined;
+    return { id: r.id, email: r.email, passwordHash: r.password_hash, tier: r.tier as BillingTier, createdAt: new Date(r.created_at).toISOString() };
   }
   async createApiKey(row: ApiKeyRow) {
     await this.pool.query(

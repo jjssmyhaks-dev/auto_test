@@ -4,7 +4,7 @@ import { TIER_QUOTAS, type BillingTier, type Span } from "@veriflow/schema";
 import { spansToOtlp } from "@veriflow/telemetry";
 import { runAgentTest, runRedTeam, parseCron, compareSteps, verifyStripeSignature } from "@veriflow/harness";
 import { rateLimit, SESSION_TTL_MS } from "./store.js";
-import type { MetricRollupRow } from "./auth.js";
+import { ROLE_RANK, type MetricRollupRow, type ProjectRole } from "./auth.js";
 import {
   hashPassword,
   hashToken,
@@ -17,7 +17,9 @@ import {
   type StepRow,
 } from "./auth.js";
 import { computeAlerts, MemoryStore, monthStartIso, QUOTAS, type CloudStore } from "./store.js";
+import { githubActionsWorkflow } from "./workflow.js";
 import type { BlobStore } from "./blobs.js";
+import { deliver, deliverResultSummary, parseChannel } from "./deliver.js";
 import { FsBlobStore } from "./blobs.js";
 
 export interface AppDeps {
@@ -245,6 +247,24 @@ export function createApp(deps?: Partial<AppDeps>) {
     return { ctx };
   };
 
+  /** Resolve the caller's role on a project (project owner, else member row). */
+  const roleOn = async (projectId: string, userId: string) => {
+    const project = await store.getProject(projectId);
+    if (!project) return undefined;
+    return store.roleFor(projectId, userId);
+  };
+
+  /** Require a minimum role on the given project; undefined = caller isn't a
+   *  member at all (403 "not a member"). Owner > admin > member > viewer. */
+  const requireRole = async (c: Context, projectId: string, min: ProjectRole) => {
+    const { ctx } = await requireAuth(c);
+    if (!ctx) return c.json({ error: "unauthorized" }, 401);
+    const role = await store.roleFor(projectId, ctx.user.id);
+    if (!role) return c.json({ error: "not a member of this project" }, 403);
+    if (ROLE_RANK[role] < ROLE_RANK[min]) return c.json({ error: `requires ${min} role` }, 403);
+    return undefined;
+  };
+
   app.get("/v1/me", async (c) => {
     const { ctx, error } = await requireAuth(c);
     if (!ctx) return error;
@@ -281,7 +301,10 @@ export function createApp(deps?: Partial<AppDeps>) {
     const { ctx, error } = await requireAuth(c);
     if (!ctx) return error;
     const project = await store.getProject(c.req.param("id"));
-    if (!project || project.userId !== ctx.user.id) return c.json({ error: "not found" }, 404);
+    if (!project) return c.json({ error: "not found" }, 404);
+    // Role-aware: members+ can mint API keys for projects they belong to.
+    const denied = await requireRole(c, project.id, "member");
+    if (denied) return denied;
     const body = (await c.req.json().catch(() => ({}))) as { name?: string };
     const plaintext = newToken("vf");
     const row = await store.createApiKey({
@@ -299,11 +322,180 @@ export function createApp(deps?: Partial<AppDeps>) {
     if (ctx.project) return ctx.project;
     if (projectId) {
       const p = await store.getProject(projectId);
-      if (p && p.userId === ctx.user.id) return p;
+      // Membership-aware: owner or any listed member can resolve the project.
+      if (p && (p.userId === ctx.user.id || (await store.roleFor(p.id, ctx.user.id)))) return p;
     }
     const list = await store.listProjects(ctx.user.id);
     return list[0];
   };
+
+  // ---- Team roles -------------------------------------------------------
+  // Ready-to-commit GitHub Actions workflow for a flow's schedule (or all
+  // scheduled flows). Returns YAML the /flows page offers as a download.
+  app.get("/v1/flows/:id/cron-workflow", async (c) => {
+    const { ctx, error } = await requireAuth(c);
+    if (!ctx) return error;
+    const project = await resolveProject(ctx, c.req.query("projectId"));
+    if (!project) return c.json({ error: "no project" }, 400);
+    const flow = (await store.listFlows(project.id)).find((f) => f.id === c.req.param("id"));
+    if (!flow) return c.json({ error: "not found" }, 404);
+    return c.json({
+      filename: `veriflow-schedule-${flow.id}.yml`,
+      workflow: githubActionsWorkflow({
+        name: `Veriflow schedule: ${flow.name}`,
+        schedule: flow.schedule ?? "*/15 * * * *",
+        apiUrl: process.env.VERIFLOW_PUBLIC_URL ?? `http://${c.req.header("host") ?? "localhost:8787"}`,
+      }),
+    });
+  });
+
+  app.post("/v1/flows/cron-workflow", async (c) => {
+    const { ctx, error } = await requireAuth(c);
+    if (!ctx) return error;
+    const body = (await c.req.json().catch(() => ({}))) as { schedule?: string; flowName?: string; apiUrl?: string };
+    const schedule = body.schedule ?? "*/15 * * * *";
+    try {
+      parseCron(schedule);
+    } catch (err) {
+      return c.json({ error: err instanceof Error ? err.message : "invalid schedule" }, 400);
+    }
+    return c.json({
+      filename: "veriflow-schedule.yml",
+      workflow: githubActionsWorkflow({
+        name: `Veriflow schedule: ${body.flowName ?? "all scheduled flows"}`,
+        schedule,
+        apiUrl: body.apiUrl ?? process.env.VERIFLOW_PUBLIC_URL ?? `http://${c.req.header("host") ?? "localhost:8787"}`,      }),
+    });
+  });
+
+  // Invites, membership CRUD, and role checks. Rules: owner > admin > member
+  // > viewer; invites require admin; only admins+ see pending invites; no one
+  // removes/demotes an owner; new invites can't exceed the inviter's rank.
+
+  app.get("/v1/projects/:id/members", async (c) => {
+    const { ctx, error } = await requireAuth(c);
+    if (!ctx) return error;
+    const project = await store.getProject(c.req.param("id"));
+    if (!project) return c.json({ error: "not found" }, 404);
+    const denied = await requireRole(c, project.id, "viewer");
+    if (denied) return denied;
+    const members = await store.listMembers(project.id);
+    const owner = await store.getUser(project.userId);
+    return c.json({
+      members: [
+        { userId: project.userId, email: owner?.email, role: "owner", addedBy: project.userId, createdAt: project.createdAt },
+        ...members.filter((m) => m.userId !== project.userId),
+      ],
+    });
+  });
+
+  app.post("/v1/projects/:id/invites", async (c) => {
+    const { ctx, error } = await requireAuth(c);
+    if (!ctx) return error;
+    const project = await store.getProject(c.req.param("id"));
+    if (!project) return c.json({ error: "not found" }, 404);
+    const denied = await requireRole(c, project.id, "admin");
+    if (denied) return denied;
+    const body = (await c.req.json()) as { email?: string; role?: ProjectRole };
+    const email = body.email?.trim().toLowerCase();
+    const role = body.role ?? "member";
+    if (!email) return c.json({ error: "email required" }, 400);
+    if (!(role in ROLE_RANK) || role === "owner") return c.json({ error: "role must be admin|member|viewer" }, 400);
+    const inviterRole = await store.roleFor(project.id, ctx.user.id);
+    if (inviterRole && ROLE_RANK[inviterRole] < ROLE_RANK[role]) return c.json({ error: "cannot invite above your role" }, 403);
+    const existing = await store.findUserByEmail(email);
+    const invite = await store.createInvite({
+      id: newId("inv"),
+      projectId: project.id,
+      email,
+      role,
+      token: newToken("vin"),
+      status: "pending",
+      invitedBy: ctx.user.id,
+      createdAt: new Date().toISOString(),
+    });
+    return c.json({ invite: { id: invite.id, email: invite.email, role: invite.role, createdAt: invite.createdAt }, acceptToken: invite.token, existingUser: !!existing });
+  });
+
+  app.get("/v1/projects/:id/invites", async (c) => {
+    const { ctx, error } = await requireAuth(c);
+    if (!ctx) return error;
+    const project = await store.getProject(c.req.param("id"));
+    if (!project) return c.json({ error: "not found" }, 404);
+    const denied = await requireRole(c, project.id, "admin");
+    if (denied) return denied;
+    const invites = (await store.listInvites(project.id)).map(({ token: _t, ...rest }) => rest);
+    return c.json({ invites });
+  });
+
+  app.delete("/v1/projects/:id/invites/:inviteId", async (c) => {
+    const { ctx, error } = await requireAuth(c);
+    if (!ctx) return error;
+    const project = await store.getProject(c.req.param("id"));
+    if (!project) return c.json({ error: "not found" }, 404);
+    const denied = await requireRole(c, project.id, "admin");
+    if (denied) return denied;
+    const ok = await store.revokeInvite(project.id, c.req.param("inviteId"));
+    return ok ? c.json({ revoked: true }) : c.json({ error: "not found" }, 404);
+  });
+
+  // Accept an invite: one-time token → membership. Works for existing accounts
+  // (must be signed in) or brand-new signups (the web login page passes the
+  // token through ?invite= and accepts right after signup/login).
+  app.post("/v1/invites/accept", async (c) => {
+    const { ctx, error } = await requireAuth(c);
+    if (!ctx) return error;
+    const body = (await c.req.json()) as { token?: string };
+    if (!body.token) return c.json({ error: "token required" }, 400);
+    const invite = await store.getInviteByToken(body.token);
+    if (!invite) return c.json({ error: "invite not found or no longer pending" }, 404);
+    if (invite.email.toLowerCase() !== ctx.user.email.toLowerCase()) {
+      return c.json({ error: `invite was sent to ${invite.email}` }, 403);
+    }
+    const accepted = await store.acceptInvite(body.token, ctx.user.id);
+    if (!accepted) return c.json({ error: "invite not found or no longer pending" }, 404);
+    return c.json({ projectId: accepted.member.projectId, role: accepted.member.role });
+  });
+
+  app.delete("/v1/projects/:id/members/:userId", async (c) => {
+    const { ctx, error } = await requireAuth(c);
+    if (!ctx) return error;
+    const project = await store.getProject(c.req.param("id"));
+    if (!project) return c.json({ error: "not found" }, 404);
+    const denied = await requireRole(c, project.id, "admin");
+    if (denied) return denied;
+    const targetId = c.req.param("userId");
+    if (targetId === project.userId) return c.json({ error: "cannot remove the project owner" }, 400);
+    // Only the owner manages admins.
+    const actorRole = await store.roleFor(project.id, ctx.user.id);
+    if (targetId !== ctx.user.id && actorRole !== "owner") {
+      const targetRole = await store.roleFor(project.id, targetId);
+      if (targetRole === "admin") return c.json({ error: "only the owner can manage admins" }, 403);
+    }
+    const ok = await store.removeMember(project.id, targetId);
+    return ok ? c.json({ removed: true }) : c.json({ error: "not found" }, 404);
+  });
+
+  app.patch("/v1/projects/:id/members/:userId", async (c) => {
+    const { ctx, error } = await requireAuth(c);
+    if (!ctx) return error;
+    const project = await store.getProject(c.req.param("id"));
+    if (!project) return c.json({ error: "not found" }, 404);
+    const denied = await requireRole(c, project.id, "admin");
+    if (denied) return denied;
+    const targetId = c.req.param("userId");
+    if (targetId === project.userId) return c.json({ error: "cannot change the project owner's role" }, 400);
+    const body = (await c.req.json()) as { role?: ProjectRole };
+    if (!body.role || !(body.role in ROLE_RANK) || body.role === "owner") {
+      return c.json({ error: "role must be admin|member|viewer" }, 400);
+    }
+    const updated = await store.setMemberRole(project.id, targetId, body.role);
+    return updated ? c.json({ member: updated }) : c.json({ error: "not found" }, 404);
+  });
+
+  // ---- Role gates replacing the raw tier checks --------------------------
+  // Same endpoints, now real permissions: admins+ for cross-project reads,
+  // member+ for the destructive demo reset.
 
   app.get("/v1/runs", async (c) => {
     const { ctx, error } = await requireAuth(c);
@@ -480,7 +672,10 @@ export function createApp(deps?: Partial<AppDeps>) {
         capture = undefined;
       }
     }
-    return c.json({ run, steps, spans, screenshots: shots, capture });
+    // Run video (recorded with --video): stream via the blob route.
+    const videoKey = (await blobs.list(`${run.id}/`)).find((k) => k.endsWith(".webm"));
+    const videoUrl = videoKey ? `/v1/runs/${run.id}/blobs/${videoKey.replace(`${run.id}/`, "")}` : undefined;
+    return c.json({ run, steps, spans, screenshots: shots, capture, videoUrl });
   });
 
   app.get("/v1/runs/:id/blobs/*", async (c) => {
@@ -493,7 +688,7 @@ export function createApp(deps?: Partial<AppDeps>) {
     const buf = await blobs.get(`${runId}/${rest}`);
     if (!buf) return c.json({ error: "not found" }, 404);
     return c.body(Uint8Array.from(buf), 200, {
-      "content-type": rest.endsWith(".png") ? "image/png" : "application/octet-stream",
+      "content-type": rest.endsWith(".png") ? "image/png" : rest.endsWith(".webm") ? "video/webm" : "application/octet-stream",
     });
   });
 
@@ -762,16 +957,22 @@ export function createApp(deps?: Partial<AppDeps>) {
     }
     const webhook = process.env.VERIFLOW_ALERT_WEBHOOK;
     let delivery = "log_only";
+    // Deliver to each triggered rule's configured channel (email:/slack:/
+    // webhook:) with retry. Awaited so the caller sees real delivery status.
+    const deliveryResults = [];
+    const channels = new Set<string>(triggeredRules.map((t) => rules.find((r) => r.id === t.ruleId)?.channel ?? ""));
     if (webhook && (alerts.length || triggeredRules.length)) {
       delivery = "webhook";
-      // Fire-and-forget POST; a slow webhook must not delay the API response.
-      void fetch(webhook, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ projectId: project?.id, alerts, triggeredRules, at: now }),
-      }).catch((err) => console.error("alert webhook failed:", err instanceof Error ? err.message : err));
+      channels.add("webhook:");
     }
-    return c.json({ alerts, rules, triggeredRules, delivery });
+    for (const channel of channels) {
+      if (!channel) continue;
+      deliveryResults.push(
+        await deliver(channel, { projectId: project?.id, alerts, triggeredRules, at: now }),
+      );
+    }
+    if (deliveryResults.length) delivery = "multi_channel";
+    return c.json({ alerts, rules, triggeredRules, delivery, ...deliverResultSummary(deliveryResults) });
   });
 
   // Spec 1.4 human-in-the-loop for headless/CI: a run creates a pause request,
@@ -795,7 +996,18 @@ export function createApp(deps?: Partial<AppDeps>) {
       createdAt: new Date(now).toISOString(),
       expiresAt: new Date(now + ttl * 1000).toISOString(),
     });
-    return c.json({ pause, magicLink: `/human-pauses/${pause.id}` });
+    // Deliver the magic link to every configured channel on this project's
+    // alert rules (email:/slack:/webhook:) — that's where “the team” lives.
+    const pausePayload = {
+      pause: { id: pause.id, runId: pause.runId, reason: pause.reason, prompt: pause.prompt },
+      magicLink: `/human-pauses/${pause.id}`,
+      expiresAt: pause.expiresAt,
+    };
+    const channels = [...new Set((await store.listAlertRules(project.id)).map((r) => r.channel))];
+    const deliveryResults = [];
+    for (const channel of channels) deliveryResults.push(await deliver(channel, pausePayload));
+    const delivery = deliverResultSummary(deliveryResults);
+    return c.json({ pause, magicLink: `/human-pauses/${pause.id}`, delivery });
   });
 
   app.get("/v1/human-pauses/:id", async (c) => {
@@ -838,12 +1050,16 @@ export function createApp(deps?: Partial<AppDeps>) {
     if ((body.metric !== "success_rate" && body.metric !== "cost_spike") || typeof body.threshold !== "number") {
       return c.json({ error: "metric must be success_rate|cost_spike and threshold a number" }, 400);
     }
+    const channel = body.channel ?? "webhook";
+    if (!parseChannel(channel)) {
+      return c.json({ error: "channel must be email:<address>, slack:<webhook-url>, or webhook:<url>" }, 400);
+    }
     const rule = await store.saveAlertRule({
       id: newId("rule"),
       projectId: project.id,
       metric: body.metric,
       threshold: body.threshold,
-      channel: body.channel ?? "webhook",
+      channel,
       createdAt: new Date().toISOString(),
     });
     return c.json({ rule });
@@ -1036,16 +1252,51 @@ export function createApp(deps?: Partial<AppDeps>) {
   app.get("/v1/onboarding/funnel", async (c) => {
     const { ctx, error } = await requireAuth(c);
     if (!ctx) return error;
-    if (ctx.user.tier !== "team") return c.json({ error: "Team tier required" }, 403);
+    // Team feature, scoped to SHARED projects the caller administers — i.e.
+    // projects that actually have invited members. A solo personal project
+    // (every signup gets one) doesn't qualify, otherwise the gate is moot.
+    // Without ?projectId this means "every shared project I'm admin/owner on".
+    const requested = c.req.query("projectId");
+    const candidateIds: string[] = [];
+    if (requested) {
+      const p = await store.getProject(requested);
+      if (!p) return c.json({ error: "not found" }, 404);
+      const denied = await requireRole(c, p.id, "admin");
+      if (denied) return denied;
+      candidateIds.push(p.id);
+    } else {
+      for (const p of await store.listProjects(ctx.user.id)) {
+        const role = await store.roleFor(p.id, ctx.user.id);
+        if (role && ROLE_RANK[role] >= ROLE_RANK.admin) candidateIds.push(p.id);
+      }
+      for (const m of await store.listMemberships(ctx.user.id)) {
+        if (ROLE_RANK[m.role] >= ROLE_RANK.admin && !candidateIds.includes(m.projectId)) candidateIds.push(m.projectId);
+      }
+    }
+    // Keep only shared projects (≥1 invited member) and union member userIds.
+    const targetProjects: string[] = [];
+    const userIds = new Set<string>();
+    for (const id of candidateIds) {
+      const members = await store.listMembers(id);
+      if (!members.length) continue;
+      targetProjects.push(id);
+      const p = await store.getProject(id);
+      if (p) userIds.add(p.userId);
+      for (const m of members) userIds.add(m.userId);
+    }
+    if (!targetProjects.length && !requested) {
+      return c.json({ error: "requires admin role on a shared project" }, 403);
+    }
     const all = await store.listAllUserProgress();
+    const scoped = all.filter((row) => userIds.has(row.userId));
     const actions = ["queue_run", "scrub_trace", "create_flow", "create_alert_rule"];
-    const total = all.length;
+    const total = scoped.length;
     const steps = actions.map((action) => {
-      const count = all.filter((p) => p.onboardingDone.includes(action)).length;
+      const count = scoped.filter((p) => p.onboardingDone.includes(action)).length;
       return { action, count, pct: total === 0 ? 0 : Math.round((count / total) * 100) };
     });
-    const completedAll = all.filter((p) => actions.every((a) => p.onboardingDone.includes(a))).length;
-    return c.json({ total, steps, completedAll });
+    const completedAll = scoped.filter((p) => actions.every((a) => p.onboardingDone.includes(a))).length;
+    return c.json({ total, steps, completedAll, projects: targetProjects });
   });
 
   // Demo reset: wipe this project's runs (with steps/spans/blobs), flows,
@@ -1055,9 +1306,12 @@ export function createApp(deps?: Partial<AppDeps>) {
   app.post("/v1/demo-reset", async (c) => {
     const { ctx, error } = await requireAuth(c);
     if (!ctx) return error;
-    if (ctx.user.tier !== "team") return c.json({ error: "Team tier required" }, 403);
+    // Destructive across the project — members+, same as tier-gate before
+    // but now role-based (the owner or any member can replay their demo).
     const project = await resolveProject(ctx, c.req.query("projectId"));
     if (!project) return c.json({ error: "no project" }, 400);
+    const denied = await requireRole(c, project.id, "member");
+    if (denied) return denied;
     // Evidence blobs are keyed by run id (`<runId>/<path>`) — collect the
     // project's run ids BEFORE the wipe, then drop each run's blobs.
     const runIds = (await store.listRuns(project.id)).map((r) => r.id);

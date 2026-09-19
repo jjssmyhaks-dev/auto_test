@@ -5,13 +5,17 @@ import { TIER_QUOTAS, type BillingTier } from "@veriflow/schema";
 import {
   hashToken,
   newId,
+  ROLE_RANK,
   type AlertRuleRow,
   type ApiKeyRow,
   type DeviceJobRow,
   type DeviceRow,
   type FlowRow,
   type HumanPauseRow,
+  type InviteRow,
+  type MemberRow,
   type MetricRollupRow,
+  type ProjectRole,
   type ProjectRow,
   type RunRow,
   type SessionRow,
@@ -34,6 +38,22 @@ export interface CloudStore {
   createProject(userId: string, name: string): Promise<ProjectRow>;
   listProjects(userId: string): Promise<ProjectRow[]>;
   getProject(id: string): Promise<ProjectRow | undefined>;
+  // Team roles: explicit membership with per-project roles. `roleFor` returns
+  // the best of (project owner, member row) — existing single-user projects
+  // keep working as owner without backfill.
+  addMember(row: MemberRow): Promise<MemberRow>;
+  listMembers(projectId: string): Promise<(MemberRow & { email?: string })[]>;
+  removeMember(projectId: string, userId: string): Promise<boolean>;
+  setMemberRole(projectId: string, userId: string, role: ProjectRole): Promise<MemberRow | undefined>;
+  roleFor(projectId: string, userId: string): Promise<ProjectRole | undefined>;
+  /** All membership rows for a user (projects they belong to but don't own). */
+  listMemberships(userId: string): Promise<MemberRow[]>;
+  createInvite(row: InviteRow): Promise<InviteRow>;
+  listInvites(projectId: string): Promise<InviteRow[]>;
+  getInviteByToken(token: string): Promise<InviteRow | undefined>;
+  acceptInvite(token: string, userId: string): Promise<{ invite: InviteRow; member: MemberRow } | undefined>;
+  revokeInvite(projectId: string, inviteId: string): Promise<boolean>;
+  findUserByEmail(email: string): Promise<UserRow | undefined>;
   createApiKey(row: ApiKeyRow): Promise<ApiKeyRow>;
   listApiKeys(projectId: string): Promise<ApiKeyRow[]>;
   findApiKey(keyHash: string): Promise<ApiKeyRow | undefined>;
@@ -86,6 +106,8 @@ interface FileDb {
   users: UserRow[];
   sessions: SessionRow[];
   projects: ProjectRow[];
+  members: MemberRow[];
+  invites: InviteRow[];
   keys: ApiKeyRow[];
   runs: RunRow[];
   steps: StepRow[];
@@ -105,6 +127,8 @@ function emptyDb(): FileDb {
     users: [],
     sessions: [],
     projects: [],
+    members: [],
+    invites: [],
     keys: [],
     runs: [],
     steps: [],
@@ -205,6 +229,81 @@ export class MemoryStore implements CloudStore {
   }
   async getProject(id: string) {
     return this.db.projects.find((p) => p.id === id);
+  }
+  async addMember(row: MemberRow) {
+    const i = this.db.members.findIndex((m) => m.projectId === row.projectId && m.userId === row.userId);
+    if (i >= 0) this.db.members[i] = row;
+    else this.db.members.push(row);
+    this.touch();
+    return row;
+  }
+  async listMembers(projectId: string) {
+    return this.db.members
+      .filter((m) => m.projectId === projectId)
+      .map((m) => ({ ...m, email: this.db.users.find((u) => u.id === m.userId)?.email }));
+  }
+  async removeMember(projectId: string, userId: string) {
+    const before = this.db.members.length;
+    this.db.members = this.db.members.filter((m) => !(m.projectId === projectId && m.userId === userId));
+    const removed = before > this.db.members.length;
+    if (removed) this.touch();
+    return removed;
+  }
+  async setMemberRole(projectId: string, userId: string, role: ProjectRole) {
+    const m = this.db.members.find((m) => m.projectId === projectId && m.userId === userId);
+    if (!m) return undefined;
+    m.role = role;
+    this.touch();
+    return m;
+  }
+  async roleFor(projectId: string, userId: string) {
+    const project = this.db.projects.find((p) => p.id === projectId);
+    if (project && project.userId === userId) return "owner";
+    const member = this.db.members.find((m) => m.projectId === projectId && m.userId === userId);
+    return member?.role;
+  }
+  async listMemberships(userId: string) {
+    return this.db.members.filter((m) => m.userId === userId);
+  }
+  async createInvite(row: InviteRow) {
+    this.db.invites.push(row);
+    this.touch();
+    return row;
+  }
+  async listInvites(projectId: string) {
+    return this.db.invites.filter((i) => i.projectId === projectId).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  }
+  async getInviteByToken(token: string) {
+    return this.db.invites.find((i) => i.token === token && i.status === "pending");
+  }
+  async acceptInvite(token: string, userId: string) {
+    const invite = this.db.invites.find((i) => i.token === token && i.status === "pending");
+    if (!invite) return undefined;
+    invite.status = "accepted";
+    const existing = this.db.members.find((m) => m.projectId === invite.projectId && m.userId === userId);
+    const member: MemberRow =
+      existing ?? {
+        projectId: invite.projectId,
+        userId,
+        role: invite.role,
+        addedBy: invite.invitedBy,
+        createdAt: new Date().toISOString(),
+      };
+    if (existing) existing.role = invite.role;
+    else this.db.members.push(member);
+    this.touch();
+    return { invite, member };
+  }
+  async revokeInvite(projectId: string, inviteId: string) {
+    const invite = this.db.invites.find((i) => i.id === inviteId && i.projectId === projectId);
+    if (!invite) return false;
+    invite.status = "revoked";
+    this.touch();
+    return true;
+  }
+  async findUserByEmail(email: string) {
+    const needle = email.trim().toLowerCase();
+    return this.db.users.find((u) => u.email.toLowerCase() === needle);
   }
   async createApiKey(row: ApiKeyRow) {
     this.db.keys.push(row);

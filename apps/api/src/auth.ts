@@ -42,6 +42,33 @@ export interface ProjectRow {
   createdAt: string;
 }
 
+/** Role of a team member on a project. Owner is the creating account;
+ *  admin manages members + destructive ops; member works; viewer reads. */
+export type ProjectRole = "owner" | "admin" | "member" | "viewer";
+
+export const ROLE_RANK: Record<ProjectRole, number> = { owner: 3, admin: 2, member: 1, viewer: 0 };
+
+/** A user's membership on a project they don't (necessarily) own. */
+export interface MemberRow {
+  projectId: string;
+  userId: string;
+  role: ProjectRole;
+  addedBy: string;
+  createdAt: string;
+}
+
+/** Pending invitation: email + role, accepted with a one-time token. */
+export interface InviteRow {
+  id: string;
+  projectId: string;
+  email: string;
+  role: ProjectRole;
+  token: string;
+  status: "pending" | "accepted" | "revoked";
+  invitedBy: string;
+  createdAt: string;
+}
+
 export interface ApiKeyRow {
   id: string;
   projectId: string;

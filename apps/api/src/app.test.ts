@@ -13,7 +13,14 @@ beforeEach(() => resetRateLimits());
 
 async function json(app: ReturnType<typeof createApp>, path: string, init?: RequestInit) {
   const res = await app.request(path, init);
-  return { status: res.status, body: (await res.json()) as Record<string, unknown> };
+  const text = await res.text();
+  let body: Record<string, unknown>;
+  try {
+    body = JSON.parse(text) as Record<string, unknown>;
+  } catch {
+    throw new Error(`${res.status} ${path} → non-JSON: ${text.slice(0, 300)}`);
+  }
+  return { status: res.status, body };
 }
 
 describe("Veriflow API", () => {
@@ -148,6 +155,7 @@ describe("Veriflow API", () => {
     });
     const auth = { authorization: `Bearer ${signup.body.token as string}`, "content-type": "application/json" };
 
+    // (channel defaults to the generic webhook)
     const created = await json(app, "/v1/alerts/rules", {
       method: "POST",
       headers: auth,
@@ -244,7 +252,7 @@ describe("Veriflow API", () => {
     expect(clearedAgain.body).toEqual({ status: "cleared", deleted: false });
   });
 
-  it("aggregates the onboarding funnel across accounts", async () => {
+  it("aggregates the onboarding funnel across a team's accounts", async () => {
     const app = createApp({ store: new MemoryStore(), blobs: new FsBlobStore(join(tmpdir(), "vf-funnel")) });
     const signup = async (email: string) => {
       const r = await json(app, "/v1/auth/signup", {
@@ -253,12 +261,18 @@ describe("Veriflow API", () => {
         body: JSON.stringify({ email, password: "password1" }),
       });
       const headers = { authorization: `Bearer ${r.body.token as string}`, "content-type": "application/json" };
-      // The funnel is team-gated; upgrade so the aggregation is reachable.
-      await json(app, "/v1/billing/upgrade", { method: "POST", headers, body: JSON.stringify({ tier: "team" }) });
       return headers;
     };
     const a = await signup("f1@example.com");
     const b = await signup("f2@example.com");
+    // b joins a's project so the aggregation covers a shared team.
+    const projectsA = await json(app, "/v1/projects", { headers: a });
+    const projectA = (projectsA.body.projects as { id: string }[])[0].id;
+    const inv = await json(app, `/v1/projects/${projectA}/invites`, {
+      method: "POST", headers: a, body: JSON.stringify({ email: "f2@example.com", role: "member" }),
+    });
+    expect(inv.status).toBe(200);
+    await json(app, "/v1/invites/accept", { method: "POST", headers: b, body: JSON.stringify({ token: inv.body.acceptToken }) });
     await json(app, "/v1/progress", { method: "PUT", headers: a, body: JSON.stringify({ onboardingDone: ["queue_run", "scrub_trace"] }) });
     await json(app, "/v1/progress", { method: "PUT", headers: b, body: JSON.stringify({ onboardingDone: ["queue_run"] }) });
 
@@ -276,30 +290,243 @@ describe("Veriflow API", () => {
     expect(body.completedAll).toBe(0);
   });
 
-  it("gates the funnel and demo reset to team tier (403 for free)", async () => {
+  it("gates the funnel to admins and demo reset to members (role-based)", async () => {
     const app = createApp({ store: new MemoryStore(), blobs: new FsBlobStore(join(tmpdir(), "vf-tier")) });
-    const signup = async (email: string, tier?: string) => {
+    const signup = async (email: string) => {
       const r = await json(app, "/v1/auth/signup", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ email, password: "password1" }),
       });
-      const headers = { authorization: `Bearer ${r.body.token as string}`, "content-type": "application/json" };
-      if (tier) await json(app, "/v1/billing/upgrade", { method: "POST", headers, body: JSON.stringify({ tier }) });
-      return headers;
+      return { authorization: `Bearer ${r.body.token as string}`, "content-type": "application/json" };
     };
-    const free = await signup("free@example.com");
-    const team = await signup("team@example.com", "team");
+    const owner = await signup("owner@example.com");
+    const member = await signup("member@example.com");
+    const outsider = await signup("outsider@example.com");
 
-    const deniedFunnel = await json(app, "/v1/onboarding/funnel", { headers: free });
-    expect(deniedFunnel.status).toBe(403);
-    const allowedFunnel = await json(app, "/v1/onboarding/funnel", { headers: team });
-    expect(allowedFunnel.status).toBe(200);
+    const projects = await json(app, "/v1/projects", { headers: owner });
+    const projectId = (projects.body.projects as { id: string }[])[0].id;
 
-    const deniedReset = await json(app, "/v1/demo-reset", { method: "POST", headers: free });
-    expect(deniedReset.status).toBe(403);
-    const allowedReset = await json(app, "/v1/demo-reset", { method: "POST", headers: team });
-    expect(allowedReset.status).toBe(200);
+    // Owner invites the member as "member"; the member accepts via token.
+    const inv = await json(app, `/v1/projects/${projectId}/invites`, {
+      method: "POST",
+      headers: owner,
+      body: JSON.stringify({ email: "member@example.com", role: "member" }),
+    });
+    expect(inv.status).toBe(200);
+    const accepted = await json(app, "/v1/invites/accept", {
+      method: "POST",
+      headers: member,
+      body: JSON.stringify({ token: inv.body.acceptToken }),
+    });
+    expect(accepted.status).toBe(200);
+
+    // Member (not admin): demo reset allowed, funnel denied.
+    const memberReset = await json(app, "/v1/demo-reset", { method: "POST", headers: member });
+    expect(memberReset.status).toBe(200);
+    const memberFunnel = await json(app, "/v1/onboarding/funnel", { headers: member });
+    expect(memberFunnel.status).toBe(403);
+
+    // Non-member: nothing.
+    const outsiderFunnel = await json(app, "/v1/onboarding/funnel", { headers: outsider });
+    expect(outsiderFunnel.status).toBe(403);
+    const outsiderMembers = await json(app, `/v1/projects/${projectId}/members`, { headers: outsider });
+    expect(outsiderMembers.status).toBe(403);
+
+    // Owner: everything.
+    const ownerFunnel = await json(app, "/v1/onboarding/funnel", { headers: owner });
+    expect(ownerFunnel.status).toBe(200);
+  });
+
+  it("manages team roles: invite → accept → role matrix → owner protections", async () => {
+    const app = createApp({ store: new MemoryStore(), blobs: new FsBlobStore(join(tmpdir(), "vf-roles")) });
+    const signup = async (email: string) => {
+      const r = await json(app, "/v1/auth/signup", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ email, password: "password1" }),
+      });
+      return { authorization: `Bearer ${r.body.token as string}`, "content-type": "application/json" };
+    };
+    const owner = await signup("boss@example.com");
+    const admin = await signup("admin@example.com");
+    const member = await signup("worker@example.com");
+    const viewer = await signup("watcher@example.com");
+
+    const projects = await json(app, "/v1/projects", { headers: owner });
+    const projectId = (projects.body.projects as { id: string }[])[0].id;
+
+    // Invite the admin.
+    const invAdmin = await json(app, `/v1/projects/${projectId}/invites`, {
+      method: "POST", headers: owner, body: JSON.stringify({ email: "admin@example.com", role: "admin" }),
+    });
+    expect(invAdmin.status).toBe(200);
+    expect((await json(app, "/v1/invites/accept", { method: "POST", headers: admin, body: JSON.stringify({ token: invAdmin.body.acceptToken }) })).status).toBe(200);
+
+    // Owner protections: cannot invite above… actually invites can't be owner.
+    const invOwner = await json(app, `/v1/projects/${projectId}/invites`, {
+      method: "POST", headers: owner, body: JSON.stringify({ email: "x@example.com", role: "owner" }),
+    });
+    expect(invOwner.status).toBe(400);
+
+    // Invite wrong-email guard.
+    const invWrong = await json(app, `/v1/projects/${projectId}/invites`, {
+      method: "POST", headers: owner, body: JSON.stringify({ email: "someone-else@example.com", role: "viewer" }),
+    });
+    const wrongAccept = await json(app, "/v1/invites/accept", { method: "POST", headers: member, body: JSON.stringify({ token: invWrong.body.acceptToken }) });
+    expect(wrongAccept.status).toBe(403);
+
+    // Admin (invited by owner) invites member + viewer — admin rank suffices.
+    const invMember = await json(app, `/v1/projects/${projectId}/invites`, {
+      method: "POST", headers: admin, body: JSON.stringify({ email: "worker@example.com", role: "member" }),
+    });
+    expect(invMember.status).toBe(200);
+    await json(app, "/v1/invites/accept", { method: "POST", headers: member, body: JSON.stringify({ token: invMember.body.acceptToken }) });
+    const invViewer = await json(app, `/v1/projects/${projectId}/invites`, {
+      method: "POST", headers: admin, body: JSON.stringify({ email: "watcher@example.com", role: "viewer" }),
+    });
+    await json(app, "/v1/invites/accept", { method: "POST", headers: viewer, body: JSON.stringify({ token: invViewer.body.acceptToken }) });
+
+    // Member list shows all four roles.
+    const members = await json(app, `/v1/projects/${projectId}/members`, { headers: owner });
+    expect(members.status).toBe(200);
+    const roles = (members.body.members as { email?: string; role: string }[]).map((m) => m.role).sort();
+    expect(roles).toEqual(["admin", "member", "owner", "viewer"]);
+
+    // Viewer: read ok, write denied — viewer can't mint API keys.
+    const viewerKeys = await json(app, `/v1/projects/${projectId}/keys`, { method: "POST", headers: viewer, body: JSON.stringify({ name: "k" }) });
+    expect(viewerKeys.status).toBe(403);
+    // Member: can mint keys.
+    const memberKeys = await json(app, `/v1/projects/${projectId}/keys`, { method: "POST", headers: member, body: JSON.stringify({ name: "k" }) });
+    expect(memberKeys.status).toBe(200);
+
+    // Role matrix on invites: viewer can't invite, member can't invite, admin can.
+    for (const [who, expected] of [[viewer, 403], [member, 403], [admin, 200]] as const) {
+      const res = await json(app, `/v1/projects/${projectId}/invites`, {
+        method: "POST", headers: who, body: JSON.stringify({ email: `new-${Math.random().toString(36).slice(2)}@example.com`, role: "viewer" }),
+      });
+      expect(res.status).toBe(expected);
+    }
+
+    // Owner protections come first: admin can't remove/demote the owner.
+    const ownerId = ((members.body.members as { role: string; userId: string }[]).find((m) => m.role === "owner")!).userId;
+    const removeOwner = await json(app, `/v1/projects/${projectId}/members/${ownerId}`, { method: "DELETE", headers: admin });
+    expect(removeOwner.status).toBe(400);
+
+    // Member can't remove the admin; owner can.
+    const adminId = ((members.body.members as { email?: string; userId: string }[]).find((m) => m.email === "admin@example.com")!).userId;
+    const memberRemovesAdmin = await json(app, `/v1/projects/${projectId}/members/${adminId}`, { method: "DELETE", headers: member });
+    expect(memberRemovesAdmin.status).toBe(403);
+    const ownerRemovesAdmin = await json(app, `/v1/projects/${projectId}/members/${adminId}`, { method: "DELETE", headers: owner });
+    expect(ownerRemovesAdmin.status).toBe(200);
+  });
+
+  it("delivers alert-rule and human-pause notifications with retry (email/slack)", async () => {
+    const app = createApp({ store: new MemoryStore(), blobs: new FsBlobStore(join(tmpdir(), "vf-deliver")) });
+    const signup = await json(app, "/v1/auth/signup", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ email: "pager@example.com", password: "password1" }),
+    });
+    const auth = { authorization: `Bearer ${signup.body.token as string}`, "content-type": "application/json" };
+
+    // A flaky receiver: fails the first two attempts, then 200s. Verifies the
+    // retry policy actually re-POSTs instead of giving up after one failure.
+    let hits = 0;
+    const server = createServer((req, res) => {
+      hits++;
+      if (hits < 3) {
+        res.writeHead(503);
+        res.end("nope");
+        return;
+      }
+      let raw = "";
+      req.on("data", (d) => (raw += d));
+      req.on("end", () => {
+        res.writeHead(200);
+        res.end(raw || "ok");
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const port = (server.address() as { port: number }).port;
+
+    // Rule delivering to Slack — the receiver doubles as a Slack webhook.
+    const rule = await json(app, "/v1/alerts/rules", {
+      method: "POST", headers: auth,
+      body: JSON.stringify({ metric: "success_rate", threshold: 0.99, channel: `slack:http://127.0.0.1:${port}/hook` }),
+    });
+    expect(rule.status).toBe(200);
+
+    // Bad channel format is rejected.
+    const badRule = await json(app, "/v1/alerts/rules", {
+      method: "POST", headers: auth,
+      body: JSON.stringify({ metric: "success_rate", threshold: 0.5, channel: "carrier-pigeon:huh" }),
+    });
+    expect(badRule.status).toBe(400);
+
+    // Trigger the rule: make the success rate low by ingesting a failed run.
+    const projects = await json(app, "/v1/projects", { headers: auth });
+    const projectId = (projects.body.projects as { id: string }[])[0].id;
+    await json(app, "/v1/runs", {
+      method: "POST", headers: auth,
+      body: JSON.stringify({ id: "run_pager", projectId, status: "failed", startedAt: new Date().toISOString(), kind: "browser", objective: "x", costUsd: 0.01, steps: 1 }),
+    });
+    const evalRes = await json(app, "/v1/alerts", { headers: auth });
+    expect(evalRes.status).toBe(200);
+    expect(evalRes.body.delivery).toBe("multi_channel");
+    const summary = evalRes.body as { delivered: number; failed: number; results: { status: string; attempts: number }[] };
+    expect(summary.delivered).toBeGreaterThanOrEqual(1);
+    expect(summary.results.some((r) => r.attempts === 3)).toBe(true);
+
+    // Human pause → delivery to the same rule's channel.
+    const pause = await json(app, "/v1/human-pauses", {
+      method: "POST", headers: auth,
+      body: JSON.stringify({ runId: "run_pager", reason: "captcha" }),
+    });
+    expect(pause.status).toBe(200);
+    const pauseSummary = pause.body as { delivery: { delivered: number } };
+    expect(pauseSummary.delivery.delivered).toBeGreaterThanOrEqual(1);
+
+    // Email with no transport → skipped, not failed.
+    const emailRule = await json(app, "/v1/alerts/rules", {
+      method: "POST", headers: auth,
+      body: JSON.stringify({ metric: "cost_spike", threshold: 999, channel: "email:ops@example.com" }),
+    });
+    expect(emailRule.status).toBe(200);
+    server.close();
+  });
+
+  it("generates a GitHub Actions cron workflow for a scheduled flow", async () => {
+    const app = createApp({ store: new MemoryStore(), blobs: new FsBlobStore(join(tmpdir(), "vf-yaml")) });
+    const signup = await json(app, "/v1/auth/signup", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ email: "cron@example.com", password: "password1" }),
+    });
+    const auth = { authorization: `Bearer ${signup.body.token as string}`, "content-type": "application/json" };
+    const flow = await json(app, "/v1/flows", {
+      method: "POST", headers: auth,
+      body: JSON.stringify({ name: "nightly checkout", objective: "buy things", schedule: "0 3 * * *" }),
+    });
+    expect(flow.status).toBe(200);
+    const flowId = (flow.body.flow as { id: string }).id;
+
+    const gen = await json(app, `/v1/flows/${flowId}/cron-workflow`, { headers: auth });
+    expect(gen.status).toBe(200);
+    expect(gen.body.filename).toContain(flowId);
+    const yaml = gen.body.workflow as string;
+    expect(yaml).toContain("cron: \"0 3 * * *\"");
+    expect(yaml).toContain("veriflow schedules due --execute");
+    expect(yaml).toContain("secrets.VERIFLOW_API_KEY");
+
+    // Free-form generator validates the cron expression.
+    const bad = await json(app, "/v1/flows/cron-workflow", {
+      method: "POST", headers: auth, body: JSON.stringify({ schedule: "nope" }),
+    });
+    expect(bad.status).toBe(400);
+    const good = await json(app, "/v1/flows/cron-workflow", {
+      method: "POST", headers: auth, body: JSON.stringify({ schedule: "*/10 * * * *", flowName: "all" }),
+    });
+    expect(good.status).toBe(200);
+    expect(good.body.workflow as string).toContain("*/10 * * * *");
   });
 
   it("demo reset wipes the project's runs, flows, rules, and ledger", async () => {
@@ -327,7 +554,7 @@ describe("Veriflow API", () => {
       }),
     });
     expect(ing.status).toBe(200);
-    const runId = (ing.body as { id?: string }).id;
+    const runId = (ing.body as { run?: { id?: string }; id?: string }).run?.id ?? (ing.body as { id?: string }).id;
     if (!runId) throw new Error(`ingest returned no run id: ${JSON.stringify(ing.body).slice(0, 200)}`);
     await json(app, "/v1/flows", { method: "POST", headers: auth, body: JSON.stringify({ name: "demo-flow", objective: "x" }) });
     await json(app, "/v1/alerts/rules", { method: "POST", headers: auth, body: JSON.stringify({ metric: "cost_spike", threshold: 10 }) });

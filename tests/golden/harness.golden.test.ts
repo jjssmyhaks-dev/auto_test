@@ -1,4 +1,4 @@
-import { mkdtempSync, existsSync } from "node:fs";
+import { mkdtempSync, existsSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
@@ -57,6 +57,26 @@ describe("golden flows — auth & navigation (spec 1.8)", () => {
     expect(result.status).toBe("passed");
     expect(result.evidencePath ? existsSync(result.evidencePath) : false).toBe(true);
     expect(result.reportPath ? existsSync(result.reportPath) : false).toBe(true);
+  }, 60_000);
+
+  it("01b records a webm video when video: true", async () => {
+    const home = newHome();
+    const result = await runHarness({
+      objective: "log in with demo@acme.test and assert the dashboard heading",
+      envUrl: site.url,
+      headless: true,
+      home,
+      provider: scriptedProvider([...loginSteps(), assertHeading("Dashboard"), done()]),
+      record: true,
+      video: true,
+    });
+    expect(result.status).toBe("passed");
+    // The video is flushed on context close, renamed out of the temp dir,
+    // and must be a real non-empty .webm sitting in the run's evidence dir.
+    expect(result.videoPath).toBeTruthy();
+    expect(result.videoPath!.endsWith("video.webm")).toBe(true);
+    expect(existsSync(result.videoPath!)).toBe(true);
+    expect(statSync(result.videoPath!).size).toBeGreaterThan(0);
   }, 60_000);
 
   it("02 navigates dashboard → cart and back", async () => {

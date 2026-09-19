@@ -68,6 +68,7 @@ program
   .option("--dry-run", "Guard + decide but skip Playwright ACT", false)
   .option("--devtools", "Capture CDP network/console/performance", false)
   .option("--otlp", "Write OTel-shaped JSON (otlp.json) for the run", false)
+  .option("--video", "Record a WebM video of the run (saved in the run dir; synced with --sync)", false)
   .option("--sync", "Push evidence to the cloud API after the run", false)
   .option("--pause-endpoint", "Resolve request_human pauses via a cloud magic link (CI) instead of stdin", false)
   .action(async (objective: string, opts: Record<string, unknown>) => {
@@ -84,12 +85,13 @@ program
         envUrl: opts.env as string | undefined,
         headless: Boolean(opts.headless),
         profile: opts.profile as string | undefined,
-        record: opts.record !== false,
         agent: Boolean(opts.agent),
         yesIMeanIt: Boolean(opts.yesIMeanIt),
         dryRun: Boolean(opts.dryRun),
         captureDevtools: Boolean(opts.devtools),
         otlp: Boolean(opts.otlp),
+        record: opts.record !== false,
+        video: opts.video === true,
         progress: (line) => console.error(line),
         ...(cloudForPause
           ? {

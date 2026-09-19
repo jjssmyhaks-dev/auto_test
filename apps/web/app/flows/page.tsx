@@ -85,6 +85,23 @@ export default function FlowsPage() {
     }
   }
 
+  /** Download a ready-to-commit GitHub Actions cron workflow for this flow. */
+  async function downloadWorkflow(flow: Flow) {
+    try {
+      const res = await api<{ filename: string; workflow: string }>(`/v1/flows/${flow.id}/cron-workflow`);
+      const blob = new Blob([res.workflow], { type: "text/x-yaml" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = res.filename;
+      a.click();
+      URL.revokeObjectURL(url);
+      setNote(`downloaded ${res.filename} — commit to .github/workflows/ and set VERIFLOW_API_KEY as a repo secret`);
+    } catch (e) {
+      setNote(e instanceof Error ? e.message : String(e));
+    }
+  }
+
   async function rerun(flow: Flow) {
     try {
       const res = await api<{ id: string }>("/v1/runs", {
@@ -168,7 +185,12 @@ export default function FlowsPage() {
                   <td>
                     <button type="button" onClick={() => rerun(f)}>
                       Queue re-run
-                    </button>
+                    </button>{" "}
+                    {f.schedule ? (
+                      <button type="button" onClick={() => downloadWorkflow(f)}>
+                        CI workflow
+                      </button>
+                    ) : null}
                   </td>
                 </tr>
               );

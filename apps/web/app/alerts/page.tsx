@@ -15,10 +15,11 @@ export default function AlertsPage() {
   const [error, setError] = useState<string | null>(null);
   const [metric, setMetric] = useState<"success_rate" | "cost_spike">("success_rate");
   const [threshold, setThreshold] = useState("0.8");
+  const [channel, setChannel] = useState("slack:");
   const [note, setNote] = useState<string | null>(null);
 
   function load() {
-    api<{ alerts: Alert[]; rules?: Rule[]; delivery: string }>("/v1/alerts")
+    api<{ alerts: Alert[]; rules?: Rule[]; delivery: string }>('/v1/alerts')
       .then((r) => {
         setAlerts(r.alerts);
         setRules(r.rules ?? []);
@@ -40,9 +41,9 @@ export default function AlertsPage() {
     try {
       await api("/v1/alerts/rules", {
         method: "POST",
-        body: JSON.stringify({ metric, threshold: value }),
+        body: JSON.stringify({ metric, threshold: value, channel }),
       });
-      setNote(`rule saved: ${metric} @ ${value}`);
+      setNote(`rule saved: ${metric} @ ${value} → ${channel}`);
       markAction("create_alert_rule");
       load();
     } catch (e) {
@@ -81,7 +82,8 @@ export default function AlertsPage() {
       hint={{
         steps: [
           "Rules watch per-flow reliability — e.g. fire when success drops below 50% or cost spikes.",
-          "Create a rule, and it evaluates on every run event; webhook payloads include the rules that triggered.",
+          "Each rule delivers to its own channel: email:<address>, slack:<webhook-url>, or webhook:<url>.",
+          "Email needs VERIFLOW_SMTP_URL or VERIFLOW_EMAIL_ENDPOINT on the server; delivery retries 3× with backoff.",
         ],
       }}
     >
@@ -125,6 +127,34 @@ export default function AlertsPage() {
         Threshold
         <input value={threshold} onChange={(e) => setThreshold(e.target.value)} />
       </label>
+      <label>
+        Deliver to
+        <select value={channel.startsWith("email:") ? "email" : channel.startsWith("slack:") ? "slack" : "webhook"} onChange={(e) => setChannel(`${e.target.value}:`)}>
+          <option value="slack">Slack (VERIFLOW_SLACK_WEBHOOK)</option>
+          <option value="email">Email (per-rule address)</option>
+          <option value="webhook">Generic webhook</option>
+        </select>
+      </label>
+      {channel.startsWith("email:") ? (
+        <label>
+          Email address
+          <input
+            value={channel.slice("email:".length)}
+            placeholder="ops@acme.dev"
+            onChange={(e) => setChannel(`email:${e.target.value}`)}
+          />
+        </label>
+      ) : null}
+      {channel.startsWith("slack:") || channel.startsWith("webhook:") ? (
+        <label>
+          Webhook URL (blank = server env default)
+          <input
+            value={channel.slice(channel.indexOf(":") + 1)}
+            placeholder="https://hooks.slack.com/services/…"
+            onChange={(e) => setChannel(`${channel.slice(0, channel.indexOf(":") + 1)}${e.target.value}`)}
+          />
+        </label>
+      ) : null}
       <button type="button" onClick={addRule}>
         Add rule
       </button>

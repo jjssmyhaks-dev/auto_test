@@ -1,4 +1,5 @@
 import { createInterface } from "node:readline/promises";
+import { readdirSync, renameSync, rmSync, statSync } from "node:fs";
 import { stdin as input, stdout as output } from "node:process";
 import { randomUUID } from "node:crypto";
 import { writeFileSync } from "node:fs";
@@ -30,6 +31,8 @@ export interface RunOptions {
   captureDevtools?: boolean;
   otlp?: boolean;
   sync?: boolean;
+  /** Record a WebM video of the whole run (Playwright recordVideo). */
+  video?: boolean;
   /** Optional live progress hook (interactive TUI-lite). Not called in agent mode. */
   progress?: (line: string) => void;
 }
@@ -40,6 +43,8 @@ export interface RunResult {
   error?: string;
   evidencePath?: string;
   reportPath?: string;
+  /** Local path of the recorded WebM when `record` was set. */
+  videoPath?: string;
 }
 
 export type { ConversationHarness } from "./agent-test.js";
@@ -114,10 +119,17 @@ export async function runHarness(opts: RunOptions): Promise<RunResult> {
 
   let browser: Browser | undefined;
   let page: Page | undefined;
+  const videoOn = opts.video === true;
 
   try {
     browser = await chromium.launch({ headless: Boolean(opts.headless) });
-    const context = await browser.newContext();
+    // recordVideo saves on context close, so the context is kept and closed
+    // explicitly in the finally block below.
+    const context = await browser.newContext({
+      recordVideo: videoOn
+        ? { dir: rp.dir, size: { width: 1280, height: 720 } }
+        : undefined,
+    });
     page = await context.newPage();
     if (captureOn) {
       capture = await attachDevtoolsCapture(page);
@@ -310,7 +322,39 @@ export async function runHarness(opts: RunOptions): Promise<RunResult> {
     error = err instanceof Error ? err.message : String(err);
     logger.emit("log", { error });
   } finally {
+    // Close the context first: Playwright flushes recordVideo on context
+    // close, before the browser shuts down.
+    try {
+      await page?.context().close();
+    } catch {
+      /* already closed */
+    }
     await browser?.close();
+  }
+
+  // Move the recorded video into the run dir with a stable name.
+  let videoPath: string | undefined;
+  if (videoOn) {
+    try {
+      const webm = readdirSync(rp.dir).filter((f) => f.endsWith(".webm"));
+      if (webm.length > 0) {
+        const target = join(rp.dir, "video.webm");
+        if (webm.length > 1) {
+          // Keep the largest (longest) recording if multiple pages opened.
+          const sized = webm
+            .map((f) => ({ f, size: statSync(join(rp.dir, f)).size }))
+            .sort((a, b) => b.size - a.size);
+          renameSync(join(rp.dir, sized[0].f), target);
+          for (const extra of sized.slice(1)) rmSync(join(rp.dir, extra.f), { force: true });
+        } else {
+          renameSync(join(rp.dir, webm[0]), target);
+        }
+        videoPath = target;
+        progress(`▸ video saved: ${target}`);
+      }
+    } catch (err) {
+      progress(`▸ video save failed: ${err instanceof Error ? err.message : err}`);
+    }
   }
 
   logger.emit("run_end", { status, error, steps: stepIndex, costUsd, tokens });
@@ -345,5 +389,6 @@ export async function runHarness(opts: RunOptions): Promise<RunResult> {
     error,
     evidencePath: pack.zipPath,
     reportPath: pack.reportPath,
+    videoPath,
   };
 }
