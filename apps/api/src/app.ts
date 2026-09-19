@@ -110,6 +110,7 @@ export function createApp(deps?: Partial<AppDeps>) {
         "/v1/agent-tests": { post: {} },
         "/v1/progress": { get: {}, put: {}, delete: {} },
         "/v1/onboarding/funnel": { get: {} },
+        "/v1/demo-reset": { post: {} },
         "/v1/metrics/rollups": { get: {} },
         "/v1/metrics/rollups/refresh": { post: {} },
         "/v1/metrics/{flowId}": { get: {} },
@@ -725,10 +726,13 @@ export function createApp(deps?: Partial<AppDeps>) {
   });
 
   // Activation funnel: how many accounts completed each onboarding action —
-  // powers the drop-off view on the usage page.
+  // powers the drop-off view on the usage page. Team tier only: it exposes
+  // aggregate sign-up behaviour, not per-user data, so keep it behind the
+  // paying tiers (free accounts get a 403 and the UI hides the section).
   app.get("/v1/onboarding/funnel", async (c) => {
     const { ctx, error } = await requireAuth(c);
     if (!ctx) return error;
+    if (ctx.user.tier !== "team") return c.json({ error: "Team tier required" }, 403);
     const all = await store.listAllUserProgress();
     const actions = ["queue_run", "scrub_trace", "create_flow", "create_alert_rule"];
     const total = all.length;
@@ -738,6 +742,25 @@ export function createApp(deps?: Partial<AppDeps>) {
     });
     const completedAll = all.filter((p) => actions.every((a) => p.onboardingDone.includes(a))).length;
     return c.json({ total, steps, completedAll });
+  });
+
+  // Demo reset: wipe this project's runs (with steps/spans/blobs), flows,
+  // alert rules, and the usage ledger so the dashboard replays from scratch.
+  // Onboarding/tour progress is intentionally preserved — reset THAT from
+  // Settings. Team tier: destructive across the whole project.
+  app.post("/v1/demo-reset", async (c) => {
+    const { ctx, error } = await requireAuth(c);
+    if (!ctx) return error;
+    if (ctx.user.tier !== "team") return c.json({ error: "Team tier required" }, 403);
+    const project = await resolveProject(ctx, c.req.query("projectId"));
+    if (!project) return c.json({ error: "no project" }, 400);
+    // Evidence blobs are keyed by run id (`<runId>/<path>`) — collect the
+    // project's run ids BEFORE the wipe, then drop each run's blobs.
+    const runIds = (await store.listRuns(project.id)).map((r) => r.id);
+    const cleared = await store.clearProjectData(project.id);
+    let blobsRemoved = 0;
+    for (const runId of runIds) blobsRemoved += await blobs.deleteByPrefix(`${runId}/`);
+    return c.json({ status: "cleared", project: project.id, ...cleared, blobsRemoved });
   });
 
   // Spec §4: precomputed metric rollups — refresh recomputes per-flow 7/30-day

@@ -527,6 +527,29 @@ export class PgStore implements CloudStore {
     const res = await this.pool.query(`DELETE FROM user_progress WHERE user_id=$1`, [userId]);
     return (res.rowCount ?? 0) > 0;
   }
+  async clearProjectData(projectId: string) {
+    // Collect the run ids first so steps/spans (keyed by run, not project) go too.
+    const runIdsRes = await this.pool.query(`SELECT id FROM runs WHERE project_id=$1`, [projectId]);
+    const runIds = runIdsRes.rows.map((r) => r.id as string);
+    const result = { runs: runIds.length, flows: 0, alertRules: 0, usage: 0 };
+    if (runIds.length > 0) {
+      await this.pool.query(`DELETE FROM steps WHERE run_id = ANY($1)`, [runIds]);
+      await this.pool.query(`DELETE FROM spans WHERE run_id = ANY($1)`, [runIds]);
+    }
+    const tables: [string, "runs" | "flows" | "alertRules" | "usage" | null][] = [
+      ["runs", "runs"],
+      ["flows", "flows"],
+      ["alert_rules", "alertRules"],
+      ["usage", "usage"],
+      ["human_pauses", null],
+      ["metric_rollups", null],
+    ];
+    for (const [table, countKey] of tables) {
+      const res = await this.pool.query(`DELETE FROM ${table} WHERE project_id=$1`, [projectId]);
+      if (countKey) result[countKey] = res.rowCount ?? 0;
+    }
+    return result;
+  }
   async listAllUserProgress(): Promise<UserProgressRow[]> {
     const res = await this.pool.query(`SELECT * FROM user_progress`);
     return res.rows.map((r) => ({

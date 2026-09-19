@@ -1,11 +1,13 @@
 import { createHmac, createHash } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { dirname, join, sep } from "node:path";
 
 export interface BlobStore {
   put(key: string, bytes: Buffer, contentType?: string): Promise<string>;
   get(key: string): Promise<Buffer | undefined>;
   list(prefix: string): Promise<string[]>;
+  /** Remove every blob under a prefix (demo reset). Returns count removed. */
+  deleteByPrefix(prefix: string): Promise<number>;
   kind: string;
 }
 
@@ -43,6 +45,18 @@ export class FsBlobStore implements BlobStore {
     walk(this.root, "");
     return out.filter((k) => k.replaceAll("\\", "/").startsWith(prefix.replaceAll("\\", "/")));
   }
+  async deleteByPrefix(prefix: string): Promise<number> {
+    const keys = await this.list(prefix);
+    for (const key of keys) {
+      const abs = join(this.root, key.replaceAll("..", "_").replaceAll("/", sep));
+      try {
+        rmSync(abs, { force: true });
+      } catch {
+        /* best-effort */
+      }
+    }
+    return keys.length;
+  }
 }
 
 /** Minimal SigV4 PutObject/GetObject for MinIO / S3-compatible APIs. */
@@ -79,6 +93,11 @@ export class S3BlobStore implements BlobStore {
   async list(prefix: string): Promise<string[]> {
     if (this.fallback) return this.fallback.list(prefix);
     return [];
+  }
+
+  async deleteByPrefix(prefix: string): Promise<number> {
+    if (this.fallback) return this.fallback.deleteByPrefix(prefix);
+    return 0;
   }
 
   async get(key: string): Promise<Buffer | undefined> {

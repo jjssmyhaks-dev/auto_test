@@ -59,6 +59,9 @@ export interface CloudStore {
   saveUserProgress(row: UserProgressRow): Promise<UserProgressRow>;
   deleteUserProgress(userId: string): Promise<boolean>;
   listAllUserProgress(): Promise<UserProgressRow[]>;
+  /** Demo reset: drop every run/step/span/flow/rule/ledger row for a project.
+   *  Returns the counts removed so the response can show what was cleared. */
+  clearProjectData(projectId: string): Promise<{ runs: number; flows: number; alertRules: number; usage: number }>;
 }
 
 interface FileDb {
@@ -306,6 +309,24 @@ export class MemoryStore implements CloudStore {
   }
   async listAllUserProgress() {
     return [...this.db.userProgress];
+  }
+  async clearProjectData(projectId: string) {
+    const runsBefore = this.db.runs.filter((r) => r.projectId === projectId);
+    const runIds = new Set(runsBefore.map((r) => r.id));
+    const result = {
+      runs: runsBefore.length,
+      flows: this.db.flows.filter((f) => f.projectId === projectId).length,
+      alertRules: this.db.alertRules.filter((r) => r.projectId === projectId).length,
+      usage: this.db.usage.filter((u) => u.projectId === projectId).length,
+    };
+    this.db.runs = this.db.runs.filter((r) => r.projectId !== projectId);
+    this.db.steps = this.db.steps.filter((s) => !runIds.has(s.runId));
+    this.db.spans = this.db.spans.filter((s) => !runIds.has(s.runId));
+    this.db.flows = this.db.flows.filter((f) => f.projectId !== projectId);
+    this.db.alertRules = this.db.alertRules.filter((r) => r.projectId !== projectId);
+    this.db.usage = this.db.usage.filter((u) => u.projectId !== projectId);
+    this.touch();
+    return result;
   }
 }
 

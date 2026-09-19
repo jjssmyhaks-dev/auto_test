@@ -33,11 +33,12 @@ export default function UsagePage() {
 
   function load() {
     api<Usage>("/v1/usage")
-      .then(setUsage)
+      .then((u) => {
+        setUsage(u);
+        // Funnel is team-gated; skip the call (and the 403 noise) for other tiers.
+        if (u.tier === "team") api<Funnel>("/v1/onboarding/funnel").then(setFunnel).catch(() => {});
+      })
       .catch((e: Error) => setError(e.message));
-    api<Funnel>("/v1/onboarding/funnel")
-      .then(setFunnel)
-      .catch(() => {});
   }
 
   useEffect(() => {

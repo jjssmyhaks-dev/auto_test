@@ -248,7 +248,10 @@ describe("Veriflow API", () => {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ email, password: "password1" }),
       });
-      return { authorization: `Bearer ${r.body.token as string}`, "content-type": "application/json" };
+      const headers = { authorization: `Bearer ${r.body.token as string}`, "content-type": "application/json" };
+      // The funnel is team-gated; upgrade so the aggregation is reachable.
+      await json(app, "/v1/billing/upgrade", { method: "POST", headers, body: JSON.stringify({ tier: "team" }) });
+      return headers;
     };
     const a = await signup("f1@example.com");
     const b = await signup("f2@example.com");
@@ -267,6 +270,86 @@ describe("Veriflow API", () => {
     expect(body.steps.find((s) => s.action === "scrub_trace")).toEqual({ action: "scrub_trace", count: 1, pct: 50 });
     expect(body.steps.find((s) => s.action === "create_flow")?.count).toBe(0);
     expect(body.completedAll).toBe(0);
+  });
+
+  it("gates the funnel and demo reset to team tier (403 for free)", async () => {
+    const app = createApp({ store: new MemoryStore(), blobs: new FsBlobStore(join(tmpdir(), "vf-tier")) });
+    const signup = async (email: string, tier?: string) => {
+      const r = await json(app, "/v1/auth/signup", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ email, password: "password1" }),
+      });
+      const headers = { authorization: `Bearer ${r.body.token as string}`, "content-type": "application/json" };
+      if (tier) await json(app, "/v1/billing/upgrade", { method: "POST", headers, body: JSON.stringify({ tier }) });
+      return headers;
+    };
+    const free = await signup("free@example.com");
+    const team = await signup("team@example.com", "team");
+
+    const deniedFunnel = await json(app, "/v1/onboarding/funnel", { headers: free });
+    expect(deniedFunnel.status).toBe(403);
+    const allowedFunnel = await json(app, "/v1/onboarding/funnel", { headers: team });
+    expect(allowedFunnel.status).toBe(200);
+
+    const deniedReset = await json(app, "/v1/demo-reset", { method: "POST", headers: free });
+    expect(deniedReset.status).toBe(403);
+    const allowedReset = await json(app, "/v1/demo-reset", { method: "POST", headers: team });
+    expect(allowedReset.status).toBe(200);
+  });
+
+  it("demo reset wipes the project's runs, flows, rules, and ledger", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "vf-reset-"));
+    const app = createApp({ store: new MemoryStore(), blobs: new FsBlobStore(join(dir, "blobs")) });
+    const signup = await json(app, "/v1/auth/signup", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ email: "reset@example.com", password: "password1" }),
+    });
+    const auth = { authorization: `Bearer ${signup.body.token as string}`, "content-type": "application/json" };
+    await json(app, "/v1/billing/upgrade", { method: "POST", headers: auth, body: JSON.stringify({ tier: "team" }) });
+
+    // Create a run (with steps, spans, and a blob), a flow, an alert rule, and usage.
+    const ing = await json(app, "/v1/runs", {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({
+        objective: "demo run",
+        envUrl: "https://example.com",
+        status: "passed",
+        steps: [{ index: 0, type: "navigate", label: "goto", status: "ok" }],
+        spans: [{ id: "sp1", type: "act", label: "goto", startedAt: new Date().toISOString(), endedAt: new Date().toISOString() }],
+        files: [{ path: "trace.json", contentBase64: Buffer.from("{}").toString("base64") }],
+      }),
+    });
+    expect(ing.status).toBe(200);
+    const runId = (ing.body as { id?: string }).id;
+    if (!runId) throw new Error(`ingest returned no run id: ${JSON.stringify(ing.body).slice(0, 200)}`);
+    await json(app, "/v1/flows", { method: "POST", headers: auth, body: JSON.stringify({ name: "demo-flow", objective: "x" }) });
+    await json(app, "/v1/alerts/rules", { method: "POST", headers: auth, body: JSON.stringify({ metric: "cost_spike", threshold: 10 }) });
+
+    // Everything exists before the reset.
+    expect(((await json(app, "/v1/runs", { headers: auth })).body.runs as unknown[]).length).toBe(1);
+    expect(((await json(app, "/v1/flows", { headers: auth })).body.flows as unknown[]).length).toBe(1);
+    expect(((await json(app, "/v1/alerts/rules", { headers: auth })).body.rules as unknown[]).length).toBe(1);
+
+    const reset = await json(app, "/v1/demo-reset", { method: "POST", headers: auth });
+    expect(reset.status).toBe(200);
+    const body = reset.body as { runs: number; flows: number; alertRules: number; blobsRemoved: number };
+    expect(body.runs).toBe(1);
+    expect(body.flows).toBe(1);
+    expect(body.alertRules).toBe(1);
+    expect(body.blobsRemoved).toBeGreaterThanOrEqual(1);
+
+    // Everything is gone after the reset.
+    expect(((await json(app, "/v1/runs", { headers: auth })).body.runs as unknown[]).length).toBe(0);
+    expect(((await json(app, "/v1/flows", { headers: auth })).body.flows as unknown[]).length).toBe(0);
+    expect(((await json(app, "/v1/alerts/rules", { headers: auth })).body.rules as unknown[]).length).toBe(0);
+    const runFetch = await json(app, `/v1/runs/${runId}`, { headers: auth });
+    expect(runFetch.status).toBe(404);
+    // ...and the run lookup for the blob route is gone, so evidence is unreachable.
+    const blobFetch = await json(app, `/v1/runs/${runId}/blobs/trace.json`, { headers: auth });
+    expect(blobFetch.status).toBe(404);
   });
 
   it("creates, lists, and resolves a human pause (CI magic link)", async () => {
