@@ -112,6 +112,29 @@ export interface FlowRow {
   envUrl?: string;
 }
 
+export interface AlertRuleRow {
+  id: string;
+  projectId: string;
+  metric: "success_rate" | "cost_spike";
+  threshold: number;
+  channel: string;
+  createdAt: string;
+  lastTriggeredAt?: string;
+}
+
+export interface HumanPauseRow {
+  id: string;
+  runId: string;
+  projectId: string;
+  reason: string;
+  prompt?: string;
+  status: "pending" | "resolved" | "expired";
+  response?: string;
+  createdAt: string;
+  resolvedAt?: string;
+  expiresAt: string;
+}
+
 export interface AuthContext {
   user: UserRow;
   project?: ProjectRow;

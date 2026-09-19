@@ -1,6 +1,6 @@
 import pg from "pg";
 import type { BillingTier } from "@veriflow/schema";
-import { newId, type ApiKeyRow, type FlowRow, type ProjectRow, type RunRow, type SpanRow, type StepRow, type UsageRow, type UserRow } from "./auth.js";
+import { newId, type AlertRuleRow, type ApiKeyRow, type FlowRow, type HumanPauseRow, type ProjectRow, type RunRow, type SpanRow, type StepRow, type UsageRow, type UserRow } from "./auth.js";
 import type { CloudStore } from "./store.js";
 
 const DDL = `
@@ -80,7 +80,55 @@ CREATE TABLE IF NOT EXISTS flows (
   objective TEXT NOT NULL,
   env_url TEXT
 );
+CREATE TABLE IF NOT EXISTS alert_rules (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  metric TEXT NOT NULL,
+  threshold DOUBLE PRECISION NOT NULL,
+  channel TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  last_triggered_at TIMESTAMPTZ
+);
+CREATE TABLE IF NOT EXISTS human_pauses (
+  id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL,
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  reason TEXT NOT NULL,
+  prompt TEXT,
+  status TEXT NOT NULL DEFAULT 'pending',
+  response TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  resolved_at TIMESTAMPTZ,
+  expires_at TIMESTAMPTZ NOT NULL
+);
 `;
+
+function mapHumanPause(r: pg.QueryResultRow): HumanPauseRow {
+  return {
+    id: r.id,
+    runId: r.run_id,
+    projectId: r.project_id,
+    reason: r.reason,
+    prompt: r.prompt ?? undefined,
+    status: r.status,
+    response: r.response ?? undefined,
+    createdAt: new Date(r.created_at).toISOString(),
+    resolvedAt: r.resolved_at ? new Date(r.resolved_at).toISOString() : undefined,
+    expiresAt: new Date(r.expires_at).toISOString(),
+  };
+}
+
+function mapAlertRule(r: pg.QueryResultRow): AlertRuleRow {
+  return {
+    id: r.id,
+    projectId: r.project_id,
+    metric: r.metric,
+    threshold: Number(r.threshold),
+    channel: r.channel,
+    createdAt: new Date(r.created_at).toISOString(),
+    lastTriggeredAt: r.last_triggered_at ? new Date(r.last_triggered_at).toISOString() : undefined,
+  };
+}
 
 function mapUser(r: pg.QueryResultRow): UserRow {
   return {
@@ -321,6 +369,62 @@ export class PgStore implements CloudStore {
   async listAllRuns() {
     const res = await this.pool.query(`SELECT * FROM runs ORDER BY started_at DESC`);
     return res.rows.map((r) => this.mapRun(r));
+  }
+
+  async saveAlertRule(rule: AlertRuleRow) {
+    await this.pool.query(
+      `INSERT INTO alert_rules (id, project_id, metric, threshold, channel, created_at, last_triggered_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7)
+       ON CONFLICT (id) DO UPDATE SET metric=EXCLUDED.metric, threshold=EXCLUDED.threshold,
+         channel=EXCLUDED.channel, last_triggered_at=EXCLUDED.last_triggered_at`,
+      [rule.id, rule.projectId, rule.metric, rule.threshold, rule.channel, rule.createdAt, rule.lastTriggeredAt ?? null],
+    );
+    return rule;
+  }
+  async listAlertRules(projectId: string) {
+    const res = await this.pool.query(`SELECT * FROM alert_rules WHERE project_id=$1 ORDER BY created_at`, [projectId]);
+    return res.rows.map(mapAlertRule);
+  }
+  async deleteAlertRule(projectId: string, ruleId: string) {
+    const res = await this.pool.query(`DELETE FROM alert_rules WHERE id=$1 AND project_id=$2`, [ruleId, projectId]);
+    return (res.rowCount ?? 0) > 0;
+  }
+  async markAlertTriggered(ruleId: string, at: string) {
+    await this.pool.query(`UPDATE alert_rules SET last_triggered_at=$2 WHERE id=$1`, [ruleId, at]);
+  }
+
+  async createHumanPause(pause: HumanPauseRow) {
+    await this.pool.query(
+      `INSERT INTO human_pauses (id, run_id, project_id, reason, prompt, status, created_at, expires_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+      [pause.id, pause.runId, pause.projectId, pause.reason, pause.prompt ?? null, pause.status, pause.createdAt, pause.expiresAt],
+    );
+    return pause;
+  }
+  async listHumanPauses(projectId: string) {
+    const res = await this.pool.query(`SELECT * FROM human_pauses WHERE project_id=$1 ORDER BY created_at DESC`, [
+      projectId,
+    ]);
+    return res.rows.map(mapHumanPause);
+  }
+  async getHumanPause(id: string) {
+    const res = await this.pool.query(`SELECT * FROM human_pauses WHERE id=$1`, [id]);
+    const r = res.rows[0];
+    if (!r) return undefined;
+    const pause = mapHumanPause(r);
+    if (pause.status === "pending" && pause.expiresAt < new Date().toISOString()) {
+      await this.pool.query(`UPDATE human_pauses SET status='expired' WHERE id=$1`, [id]);
+      return { ...pause, status: "expired" as const };
+    }
+    return pause;
+  }
+  async resolveHumanPause(id: string, response: string) {
+    const res = await this.pool.query(
+      `UPDATE human_pauses SET status='resolved', response=$2, resolved_at=now()
+       WHERE id=$1 AND status='pending' RETURNING *`,
+      [id, response],
+    );
+    return res.rows[0] ? mapHumanPause(res.rows[0]) : undefined;
   }
 
   private mapRun(r: pg.QueryResultRow): RunRow {

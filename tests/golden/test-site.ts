@@ -85,6 +85,13 @@ const PAGES: Record<string, string> = {
     <div style="height:1500px"></div>
     <p id="footer-note">You reached the footer</p>
   </body></html>`,
+  "/state": `<!DOCTYPE html><html><head><title>Acme State</title></head><body>
+    <h1>State saved</h1>
+    <script>
+      document.cookie = "session=abc123; path=/";
+      localStorage.setItem("theme", "dark");
+    </script>
+  </body></html>`,
 };
 
 const REDIRECTS: Record<string, string> = {

@@ -1,7 +1,7 @@
 import type { Page } from "playwright";
 import type { Action, Target } from "@veriflow/schema";
 import { compactTree, type A11yNode, type A11ySnapshot } from "./a11y.js";
-import { assertConsole, assertNetwork, type DevtoolsCapture } from "./devtools.js";
+import { assertConsole, assertNetwork, assertPageState, type DevtoolsCapture } from "./devtools.js";
 
 export async function observePage(page: Page): Promise<{
   url: string;
@@ -214,6 +214,10 @@ export async function verifyAction(
       if (!capture) return { ok: false, detail: "devtools capture disabled (pass --devtools)" };
       return assertConsole(capture, value);
     }
+    case "cookie_contains":
+    case "local_storage":
+    case "load_time_under":
+      return assertPageState(page, action.check, value);
     default:
       return { ok: false, detail: "unknown assert" };
   }

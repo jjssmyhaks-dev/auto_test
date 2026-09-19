@@ -7,6 +7,7 @@ import { VeriflowMark } from "@/components/veriflow-mark";
 
 const appLinks = [
   ["/runs", "Runs"],
+  ["/flows", "Flows"],
   ["/evidence", "Evidence"],
   ["/agent-test", "Agent tests"],
   ["/projects", "Projects"],

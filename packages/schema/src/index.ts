@@ -87,6 +87,9 @@ export const AssertCheckSchema = z.enum([
   "heading_contains",
   "network",
   "console",
+  "cookie_contains",
+  "local_storage",
+  "load_time_under",
 ]);
 export type AssertCheck = z.infer<typeof AssertCheckSchema>;
 

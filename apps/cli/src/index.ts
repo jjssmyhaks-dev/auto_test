@@ -48,8 +48,16 @@ program
   .option("--devtools", "Capture CDP network/console/performance", false)
   .option("--otlp", "Write OTel-shaped JSON (otlp.json) for the run", false)
   .option("--sync", "Push evidence to the cloud API after the run", false)
+  .option("--pause-endpoint", "Resolve request_human pauses via a cloud magic link (CI) instead of stdin", false)
   .action(async (objective: string, opts: Record<string, unknown>) => {
     try {
+      // Spec 1.4: headless/CI runs pause via a cloud magic link; a human resolves
+      // it from the dashboard/CLI and the run resumes on the next poll.
+      const pauseEndpoint = Boolean(opts.pauseEndpoint);
+      const cloudForPause = pauseEndpoint ? CloudClient.fromEnvOrStore() : undefined;
+      if (pauseEndpoint && !cloudForPause) {
+        throw new Error("--pause-endpoint requires credentials: run `veriflow login` or set VERIFLOW_API_KEY");
+      }
       const result = await runHarness({
         objective,
         envUrl: opts.env as string | undefined,
@@ -62,6 +70,23 @@ program
         captureDevtools: Boolean(opts.devtools),
         otlp: Boolean(opts.otlp),
         progress: (line) => console.error(line),
+        ...(cloudForPause
+          ? {
+              pause: async (prompt: string, ctx: { runId: string }) => {
+                const { pause, magicLink } = await cloudForPause.createHumanPause(
+                  ctx.runId,
+                  prompt,
+                  prompt,
+                );
+                console.error(`⏸ paused — resolve to continue: ${magicLink}`);
+                const out = await cloudForPause.awaitHumanPause(pause.id, {
+                  onPoll: (n) => console.error(`… waiting for human (${n})`),
+                });
+                if (out.timedOut) throw new Error("human pause expired before it was resolved");
+                return out.response ?? "confirmed via magic link";
+              },
+            }
+          : {}),
       });
       if (!opts.agent) {
         console.log(`run ${result.runId} ${result.status}`);
@@ -393,6 +418,59 @@ program
       }
     }
     console.log(JSON.stringify({ local, reliability }, null, 2));
+  });
+
+program
+  .command("flows")
+  .description("List saved flows (local, plus cloud when credentials exist)")
+  .action(async () => {
+    const local = listFlows();
+    const client = CloudClient.fromEnvOrStore();
+    let cloud: unknown;
+    if (client) {
+      try {
+        cloud = (await client.listFlows()).flows;
+      } catch {
+        cloud = undefined;
+      }
+    }
+    console.log(JSON.stringify({ local, cloud }, null, 2));
+  });
+
+const pauseCmd = program
+  .command("pause")
+  .description("Manage human-in-the-loop pause requests (CI magic links)");
+pauseCmd
+  .command("list")
+  .description("Show pending pauses for the project")
+  .action(async () => {
+    try {
+      const client = CloudClient.fromEnvOrStore();
+      if (!client) throw new Error("credentials required (veriflow login or VERIFLOW_API_KEY)");
+      const res = await client.request<{ pauses?: unknown[] }>("GET", "/v1/human-pauses");
+      console.log(JSON.stringify(res, null, 2));
+    } catch (err) {
+      console.error(err instanceof Error ? err.message : err);
+      process.exitCode = 1;
+    }
+  });
+pauseCmd
+  .command("resolve")
+  .description("Resolve a pending pause (the human half of the magic link)")
+  .argument("<pauseId>")
+  .option("--response <text>", "Response passed back to the run", "confirmed via veriflow CLI")
+  .action(async (pauseId: string, opts: { response?: string }) => {
+    try {
+      const client = CloudClient.fromEnvOrStore();
+      if (!client) throw new Error("credentials required (veriflow login or VERIFLOW_API_KEY)");
+      const res = await client.request("POST", `/v1/human-pauses/${encodeURIComponent(pauseId)}/resolve`, {
+        response: opts.response,
+      });
+      console.log(JSON.stringify(res, null, 2));
+    } catch (err) {
+      console.error(err instanceof Error ? err.message : err);
+      process.exitCode = 1;
+    }
   });
 
 const budget = program.command("budget").description("Local budget caps");

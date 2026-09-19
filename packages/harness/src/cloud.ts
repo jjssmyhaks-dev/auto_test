@@ -90,6 +90,38 @@ export class CloudClient {
     return this.request<{ flows: unknown[] }>("GET", "/v1/flows");
   }
 
+  createHumanPause(runId: string, reason: string, prompt?: string, ttlSeconds = 900) {
+    return this.request<{
+      pause: { id: string; status: string; expiresAt: string };
+      magicLink: string;
+    }>("POST", "/v1/human-pauses", { runId, reason, prompt, ttlSeconds });
+  }
+
+  getHumanPause(id: string) {
+    return this.request<{
+      pause: { id: string; status: "pending" | "resolved" | "expired"; response?: string; expiresAt: string };
+    }>("GET", `/v1/human-pauses/${encodeURIComponent(id)}`);
+  }
+
+  /** Polls a human pause until resolved or expired. Spec 1.4 magic-link flow. */
+  async awaitHumanPause(
+    id: string,
+    opts: { pollMs?: number; timeoutMs?: number; onPoll?: (attempt: number) => void } = {},
+  ): Promise<{ response?: string; timedOut: boolean }> {
+    const pollMs = opts.pollMs ?? 3_000;
+    const deadline = Date.now() + (opts.timeoutMs ?? 15 * 60_000);
+    let attempt = 0;
+    while (Date.now() < deadline) {
+      attempt += 1;
+      const { pause } = await this.getHumanPause(id);
+      if (pause.status === "resolved") return { response: pause.response, timedOut: false };
+      if (pause.status === "expired") return { timedOut: true };
+      opts.onPoll?.(attempt);
+      await new Promise((r) => setTimeout(r, pollMs));
+    }
+    return { timedOut: true };
+  }
+
   async syncRun(runId: string, home = veriflowHome()) {
     const events = readEvents(runId, home);
     const spans = readSpans(runId, home);

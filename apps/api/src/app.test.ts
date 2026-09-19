@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { createServer } from "node:http";
 import { createApp } from "./app.js";
 import { MemoryStore } from "./store.js";
 import { FsBlobStore } from "./blobs.js";
@@ -92,6 +93,175 @@ describe("Veriflow API", () => {
     const trace = await json(app, "/v1/runs/run_test1/trace", { headers: { "x-api-key": apiKey } });
     expect(trace.status).toBe(200);
     expect((trace.body.screenshots as unknown[]).length).toBeGreaterThan(0);
+  });
+
+  it("derives real step status, filters runs, and serves OTLP JSON", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "vf-filters-"));
+    const app = createApp({ store: new MemoryStore(), blobs: new FsBlobStore(join(dir, "blobs")) });
+    const signup = await json(app, "/v1/auth/signup", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ email: "f@example.com", password: "password1" }),
+    });
+    const auth = { authorization: `Bearer ${signup.body.token as string}`, "content-type": "application/json" };
+    const ts = new Date().toISOString();
+    await json(app, "/v1/runs", {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({
+        id: "run_mix1",
+        flowId: "flow_A",
+        objective: "mixed outcome",
+        status: "failed",
+        events: [
+          { ts, type: "decide", stepIndex: 0, payload: { action: { type: "click", target: { ref: "@e1" } } } },
+          { ts, type: "act", stepIndex: 0, payload: { ok: false, detail: "ref gone" } },
+          { ts, type: "decide", stepIndex: 1, payload: { action: { type: "finish", success: false, reason: "gave up" } } },
+          { ts, type: "verify", stepIndex: 1, payload: { finish: true, success: false, reason: "gave up" } },
+        ],
+      }),
+    });
+    const got = await json(app, "/v1/runs/run_mix1", { headers: auth });
+    const steps = got.body.steps as { index: number; status: string }[];
+    expect(steps.find((s) => s.index === 0)?.status).toBe("failed");
+
+    const failedOnly = await json(app, "/v1/runs?status=failed", { headers: auth });
+    expect((failedOnly.body.runs as { id: string }[]).every((r) => r.status === "failed")).toBe(true);
+    const flowOnly = await json(app, "/v1/runs?flowId=flow_A", { headers: auth });
+    expect((flowOnly.body.runs as { id: string }[]).length).toBe(1);
+
+    const otlp = await json(app, "/v1/runs/run_mix1/otlp", { headers: auth });
+    expect(otlp.status).toBe(200);
+  });
+
+  it("manages alert rules and flags triggered ones", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "vf-rules-"));
+    const app = createApp({ store: new MemoryStore(), blobs: new FsBlobStore(join(dir, "blobs")) });
+    const signup = await json(app, "/v1/auth/signup", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ email: "r@example.com", password: "password1" }),
+    });
+    const auth = { authorization: `Bearer ${signup.body.token as string}`, "content-type": "application/json" };
+
+    const created = await json(app, "/v1/alerts/rules", {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({ metric: "success_rate", threshold: 0.9 }),
+    });
+    expect(created.status).toBe(200);
+    const ruleId = (created.body.rule as { id: string }).id;
+
+    // Seed enough failed runs to trip the success-rate rule.
+    const ts = new Date().toISOString();
+    for (let i = 0; i < 6; i++) {
+      await json(app, "/v1/runs", {
+        method: "POST",
+        headers: auth,
+        body: JSON.stringify({ objective: `fail run ${i}`, status: "failed" }),
+      });
+    }
+    const alerts = await json(app, "/v1/alerts", { headers: auth });
+    const triggered = alerts.body.triggeredRules as { ruleId: string }[];
+    expect(triggered.some((t) => t.ruleId === ruleId)).toBe(true);
+
+    const rules = await json(app, "/v1/alerts/rules", { headers: auth });
+    const saved = (rules.body.rules as { id: string; lastTriggeredAt?: string }[]).find((r) => r.id === ruleId);
+    expect(saved?.lastTriggeredAt).toBeTruthy();
+
+    const deleted = await json(app, `/v1/alerts/rules/${ruleId}`, { method: "DELETE", headers: auth });
+    expect(deleted.status).toBe(200);
+  });
+
+  it("creates, lists, and resolves a human pause (CI magic link)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "vf-pause-"));
+    const app = createApp({ store: new MemoryStore(), blobs: new FsBlobStore(join(dir, "blobs")) });
+    const signup = await json(app, "/v1/auth/signup", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ email: "p@example.com", password: "password1" }),
+    });
+    const auth = { authorization: `Bearer ${signup.body.token as string}`, "content-type": "application/json" };
+
+    const created = await json(app, "/v1/human-pauses", {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({ runId: "run_otp", reason: "otp", prompt: "enter the code", ttlSeconds: 60 }),
+    });
+    expect(created.status).toBe(200);
+    const pause = created.body.pause as { id: string; status: string };
+    expect(pause.status).toBe("pending");
+    expect(created.body.magicLink).toBe(`/human-pauses/${pause.id}`);
+
+    const listed = await json(app, "/v1/human-pauses", { headers: auth });
+    expect((listed.body.pauses as unknown[]).length).toBe(1);
+
+    const resolveAgain = await json(app, `/v1/human-pauses/${pause.id}/resolve`, {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({ response: "code 123456 entered" }),
+    });
+    expect(resolveAgain.status).toBe(200);
+    expect((resolveAgain.body.pause as { status: string }).status).toBe("resolved");
+
+    // Resolving twice must 409 — the run must not resume on a stale link.
+    const second = await json(app, `/v1/human-pauses/${pause.id}/resolve`, {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({}),
+    });
+    expect(second.status).toBe(409);
+  });
+
+  it("runs an agent test against a stub chat endpoint and ingests it as a run", async () => {
+    const stub = createServer((req, res) => {
+      let body = "";
+      req.on("data", (c) => (body += String(c)));
+      req.on("end", () => {
+        const last = String(body).match(/"content":"([^"]*)"\}\]$/)?.[1] ?? "";
+        const orderId = last.match(/A-\d+/)?.[0];
+        const reply = orderId
+          ? `Noted, order ${orderId}.`
+          : /reset/i.test(last)
+            ? "Visit /reset and enter your email."
+            : /trash/i.test(last)
+              ? "Sorry you're upset — how can I help?"
+              : /1-hour/i.test(last)
+                ? "Refunds take 5 business days."
+                : /who are you/i.test(last)
+                  ? "I'm Acme support, happy to help."
+                  : "I only handle orders, refunds, and account questions.";
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ reply }));
+      });
+    });
+    await new Promise<void>((r) => stub.listen(0, "127.0.0.1", r as never));
+    const port = (stub.address() as { port: number }).port;
+
+    const dir = mkdtempSync(join(tmpdir(), "vf-agent-"));
+    const app = createApp({ store: new MemoryStore(), blobs: new FsBlobStore(join(dir, "blobs")) });
+    const signup = await json(app, "/v1/auth/signup", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ email: "ag@example.com", password: "password1" }),
+    });
+    const auth = { authorization: `Bearer ${signup.body.token as string}`, "content-type": "application/json" };
+    const res = await json(app, "/v1/agent-tests", {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({ endpoint: `http://127.0.0.1:${port}/chat`, scenarios: 12 }),
+    });
+    expect(res.status).toBe(200);
+    const report = res.body.report as { verdict: string; turns: unknown[]; metrics: { passRate: number } };
+    expect(["green", "yellow", "red"]).toContain(report.verdict);
+    expect(report.metrics.passRate).toBeLessThanOrEqual(1);
+    expect(report.turns.length).toBeGreaterThan(10);
+
+    const runId = res.body.runId as string;
+    const got = await json(app, `/v1/runs/${runId}`, { headers: auth });
+    expect(got.status).toBe(200);
+    expect(String((got.body.run as { objective: string }).objective)).toContain("agent-test");
+    stub.close();
   });
 
   it("returns 402 when monthly cloud quota is exhausted", async () => {

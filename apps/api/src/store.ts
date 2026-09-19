@@ -4,8 +4,10 @@ import { TIER_QUOTAS, type BillingTier } from "@veriflow/schema";
 import {
   hashToken,
   newId,
+  type AlertRuleRow,
   type ApiKeyRow,
   type FlowRow,
+  type HumanPauseRow,
   type ProjectRow,
   type RunRow,
   type SessionRow,
@@ -41,6 +43,14 @@ export interface CloudStore {
   saveFlow(row: FlowRow): Promise<FlowRow>;
   listFlows(projectId: string): Promise<FlowRow[]>;
   listAllRuns(): Promise<RunRow[]>;
+  saveAlertRule(rule: AlertRuleRow): Promise<AlertRuleRow>;
+  listAlertRules(projectId: string): Promise<AlertRuleRow[]>;
+  deleteAlertRule(projectId: string, ruleId: string): Promise<boolean>;
+  markAlertTriggered(ruleId: string, at: string): Promise<void>;
+  createHumanPause(pause: HumanPauseRow): Promise<HumanPauseRow>;
+  listHumanPauses(projectId: string): Promise<HumanPauseRow[]>;
+  getHumanPause(id: string): Promise<HumanPauseRow | undefined>;
+  resolveHumanPause(id: string, response: string): Promise<HumanPauseRow | undefined>;
 }
 
 interface FileDb {
@@ -53,6 +63,8 @@ interface FileDb {
   spans: SpanRow[];
   usage: UsageRow[];
   flows: FlowRow[];
+  alertRules: AlertRuleRow[];
+  humanPauses: HumanPauseRow[];
 }
 
 function emptyDb(): FileDb {
@@ -66,6 +78,8 @@ function emptyDb(): FileDb {
     spans: [],
     usage: [],
     flows: [],
+    alertRules: [],
+    humanPauses: [],
   };
 }
 
@@ -201,6 +215,57 @@ export class MemoryStore implements CloudStore {
   }
   async listAllRuns() {
     return this.db.runs;
+  }
+  async saveAlertRule(rule: AlertRuleRow) {
+    const i = this.db.alertRules.findIndex((r) => r.id === rule.id);
+    if (i >= 0) this.db.alertRules[i] = rule;
+    else this.db.alertRules.push(rule);
+    this.persist?.();
+    return rule;
+  }
+  async listAlertRules(projectId: string) {
+    return this.db.alertRules.filter((r) => r.projectId === projectId);
+  }
+  async deleteAlertRule(projectId: string, ruleId: string) {
+    const i = this.db.alertRules.findIndex((r) => r.id === ruleId && r.projectId === projectId);
+    if (i < 0) return false;
+    this.db.alertRules.splice(i, 1);
+    this.persist?.();
+    return true;
+  }
+  async markAlertTriggered(ruleId: string, at: string) {
+    const rule = this.db.alertRules.find((r) => r.id === ruleId);
+    if (rule) {
+      rule.lastTriggeredAt = at;
+      this.persist?.();
+    }
+  }
+  async createHumanPause(pause: HumanPauseRow) {
+    this.db.humanPauses.push(pause);
+    this.persist?.();
+    return pause;
+  }
+  async listHumanPauses(projectId: string) {
+    return this.db.humanPauses
+      .filter((p) => p.projectId === projectId)
+      .sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
+  }
+  async getHumanPause(id: string) {
+    const pause = this.db.humanPauses.find((p) => p.id === id);
+    if (pause && pause.status === "pending" && pause.expiresAt < new Date().toISOString()) {
+      pause.status = "expired";
+      this.persist?.();
+    }
+    return pause;
+  }
+  async resolveHumanPause(id: string, response: string) {
+    const pause = this.db.humanPauses.find((p) => p.id === id);
+    if (!pause || pause.status !== "pending") return undefined;
+    pause.status = "resolved";
+    pause.response = response;
+    pause.resolvedAt = new Date().toISOString();
+    this.persist?.();
+    return pause;
   }
 }
 

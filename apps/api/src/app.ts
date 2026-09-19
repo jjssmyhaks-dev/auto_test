@@ -1,6 +1,8 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { TIER_QUOTAS, type BillingTier, type Span } from "@veriflow/schema";
+import { spansToOtlp } from "@veriflow/telemetry";
+import { runAgentTest } from "@veriflow/harness";
 import {
   hashPassword,
   hashToken,
@@ -23,15 +25,36 @@ export interface AppDeps {
 
 function stepsFromEvents(runId: string, events: Array<{ type: string; ts: string; stepIndex?: number; payload: Record<string, unknown> }>): StepRow[] {
   const decides = events.filter((e) => e.type === "decide" && e.payload.action);
-  return decides.map((e, i) => ({
-    id: `${runId}_step_${i}`,
-    runId,
-    index: e.stepIndex ?? i,
-    action: e.payload.action,
-    status: "ok",
-    startedAt: e.ts,
-    endedAt: e.ts,
-  }));
+  // Derive per-step status from act/verify events (previously everything was
+  // "ok", which made failed steps look green on the dashboard).
+  const actOk = new Map<number, boolean>();
+  const verifyFail = new Map<number, string>();
+  for (const e of events) {
+    if (e.stepIndex === undefined) continue;
+    if (e.type === "act" && typeof e.payload.ok === "boolean") {
+      actOk.set(e.stepIndex, (actOk.get(e.stepIndex) ?? true) && e.payload.ok);
+    }
+    if (e.type === "verify" && e.payload.ok === false) {
+      verifyFail.set(e.stepIndex, typeof e.payload.detail === "string" ? e.payload.detail : "assert failed");
+    }
+  }
+  return decides.map((e, i) => {
+    const index = e.stepIndex ?? i;
+    const ok = actOk.get(index) ?? true;
+    const assertFail = verifyFail.get(index);
+    const action = e.payload.action as { type?: string } | undefined;
+    const isFinish = action?.type === "finish";
+    const status = isFinish || assertFail ? (ok && !assertFail ? "ok" : "failed") : ok ? "ok" : "failed";
+    return {
+      id: `${runId}_step_${i}`,
+      runId,
+      index,
+      action: e.payload.action,
+      status,
+      startedAt: e.ts,
+      endedAt: e.ts,
+    };
+  });
 }
 
 export function createApp(deps?: Partial<AppDeps>) {
@@ -65,11 +88,18 @@ export function createApp(deps?: Partial<AppDeps>) {
         "/v1/runs": { get: {}, post: {} },
         "/v1/runs/{id}": { get: {} },
         "/v1/runs/{id}/trace": { get: {} },
+        "/v1/runs/{id}/otlp": { get: {} },
         "/v1/runs/{id}/blobs/{path}": { get: {} },
         "/v1/flows": { get: {}, post: {} },
         "/v1/usage": { get: {} },
         "/v1/billing/upgrade": { post: {} },
         "/v1/alerts": { get: {} },
+        "/v1/alerts/rules": { get: {}, post: {} },
+        "/v1/alerts/rules/{id}": { delete: {} },
+        "/v1/human-pauses": { post: {} },
+        "/v1/human-pauses/{id}": { get: {} },
+        "/v1/human-pauses/{id}/resolve": { post: {} },
+        "/v1/agent-tests": { post: {} },
         "/v1/metrics/{flowId}": { get: {} },
       },
     }),
@@ -203,7 +233,15 @@ export function createApp(deps?: Partial<AppDeps>) {
     if (!ctx) return error;
     const project = await resolveProject(ctx, c.req.query("projectId"));
     if (!project) return c.json({ runs: [] });
-    return c.json({ runs: await store.listRuns(project.id) });
+    let runs = await store.listRuns(project.id);
+    // Filters for the dashboard/CI: status and flow (spec §10 run history queries).
+    const status = c.req.query("status");
+    if (status) runs = runs.filter((r) => r.status === status);
+    const flowId = c.req.query("flowId");
+    if (flowId) runs = runs.filter((r) => r.flowId === flowId);
+    const limit = Number(c.req.query("limit"));
+    if (Number.isFinite(limit) && limit > 0) runs = runs.slice(0, limit);
+    return c.json({ runs });
   });
 
   app.post("/v1/runs", async (c) => {
@@ -349,6 +387,18 @@ export function createApp(deps?: Partial<AppDeps>) {
     });
   });
 
+  // Spec 2.8: OTel-shaped JSON for a synced run — pipe it to any OTLP collector.
+  app.get("/v1/runs/:id/otlp", async (c) => {
+    const { ctx, error } = await requireAuth(c);
+    if (!ctx) return error;
+    const run = await store.getRun(c.req.param("id"));
+    if (!run) return c.json({ error: "not found" }, 404);
+    const project = await store.getProject(run.projectId);
+    if (!project || project.userId !== ctx.user.id) return c.json({ error: "not found" }, 404);
+    const spans = (await store.listSpans(run.id)) as unknown as Parameters<typeof spansToOtlp>[0];
+    return c.json(spansToOtlp(spans));
+  });
+
   app.get("/v1/flows", async (c) => {
     const { ctx, error } = await requireAuth(c);
     if (!ctx) return error;
@@ -412,18 +462,194 @@ export function createApp(deps?: Partial<AppDeps>) {
     const project = await resolveProject(ctx);
     const runs = project ? await store.listRuns(project.id) : [];
     const alerts = computeAlerts(runs);
+    // Per-project alert rules (spec §4): mark rules whose threshold the current
+    // signal crosses, and record lastTriggeredAt.
+    const now = new Date().toISOString();
+    const rules = project ? await store.listAlertRules(project.id) : [];
+    const triggeredRules: { ruleId: string; metric: string; message: string }[] = [];
+    if (project && rules.length && runs.length) {
+      const recent = runs.slice(0, 20);
+      const passRate = recent.filter((r) => r.status === "passed").length / Math.max(recent.length, 1);
+      const costs = runs.map((r) => r.costUsd ?? 0).filter((v) => v > 0);
+      const lastCost = costs[0] ?? 0;
+      for (const rule of rules) {
+        const hit =
+          rule.metric === "success_rate"
+            ? passRate < rule.threshold
+            : lastCost > 0 && lastCost > rule.threshold;
+        if (hit) {
+          triggeredRules.push({
+            ruleId: rule.id,
+            metric: rule.metric,
+            message: `rule ${rule.metric} crossed (threshold ${rule.threshold})`,
+          });
+          await store.markAlertTriggered(rule.id, now);
+        }
+      }
+    }
     const webhook = process.env.VERIFLOW_ALERT_WEBHOOK;
     let delivery = "log_only";
-    if (webhook && alerts.length) {
+    if (webhook && (alerts.length || triggeredRules.length)) {
       delivery = "webhook";
       // Fire-and-forget POST; a slow webhook must not delay the API response.
       void fetch(webhook, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ projectId: project?.id, alerts, at: new Date().toISOString() }),
+        body: JSON.stringify({ projectId: project?.id, alerts, triggeredRules, at: now }),
       }).catch((err) => console.error("alert webhook failed:", err instanceof Error ? err.message : err));
     }
-    return c.json({ alerts, delivery });
+    return c.json({ alerts, rules, triggeredRules, delivery });
+  });
+
+  // Spec 1.4 human-in-the-loop for headless/CI: a run creates a pause request,
+  // a human resolves the magic link (or POSTs), the CLI polls until resolved.
+  app.post("/v1/human-pauses", async (c) => {
+    const { ctx, error } = await requireAuth(c);
+    if (!ctx) return error;
+    const project = await resolveProject(ctx);
+    if (!project) return c.json({ error: "no project" }, 400);
+    const body = (await c.req.json()) as { runId?: string; reason?: string; prompt?: string; ttlSeconds?: number };
+    if (!body.runId || !body.reason) return c.json({ error: "runId and reason required" }, 400);
+    const ttl = Math.min(Math.max(body.ttlSeconds ?? 900, 30), 3600);
+    const now = Date.now();
+    const pause = await store.createHumanPause({
+      id: newId("pause"),
+      runId: body.runId,
+      projectId: project.id,
+      reason: body.reason,
+      prompt: body.prompt,
+      status: "pending",
+      createdAt: new Date(now).toISOString(),
+      expiresAt: new Date(now + ttl * 1000).toISOString(),
+    });
+    return c.json({ pause, magicLink: `/human-pauses/${pause.id}` });
+  });
+
+  app.get("/v1/human-pauses/:id", async (c) => {
+    const { ctx, error } = await requireAuth(c);
+    if (!ctx) return error;
+    const pause = await store.getHumanPause(c.req.param("id"));
+    if (!pause) return c.json({ error: "not found" }, 404);
+    const project = await store.getProject(pause.projectId);
+    if (!project || project.userId !== ctx.user.id) return c.json({ error: "not found" }, 404);
+    return c.json({ pause });
+  });
+
+  app.post("/v1/human-pauses/:id/resolve", async (c) => {
+    const { ctx, error } = await requireAuth(c);
+    if (!ctx) return error;
+    const pause = await store.getHumanPause(c.req.param("id"));
+    if (!pause) return c.json({ error: "not found" }, 404);
+    const project = await store.getProject(pause.projectId);
+    if (!project || project.userId !== ctx.user.id) return c.json({ error: "not found" }, 404);
+    const body = (await c.req.json().catch(() => ({}))) as { response?: string };
+    const resolved = await store.resolveHumanPause(pause.id, body.response ?? "confirmed by human");
+    if (!resolved) return c.json({ error: `pause is ${pause.status}, not pending` }, 409);
+    return c.json({ pause: resolved });
+  });
+
+  app.get("/v1/human-pauses", async (c) => {
+    const { ctx, error } = await requireAuth(c);
+    if (!ctx) return error;
+    const project = await resolveProject(ctx);
+    if (!project) return c.json({ pauses: [] });
+    return c.json({ pauses: await store.listHumanPauses(project.id) });
+  });
+
+  app.post("/v1/alerts/rules", async (c) => {
+    const { ctx, error } = await requireAuth(c);
+    if (!ctx) return error;
+    const project = await resolveProject(ctx);
+    if (!project) return c.json({ error: "no project" }, 400);
+    const body = (await c.req.json()) as { metric?: string; threshold?: number; channel?: string };
+    if ((body.metric !== "success_rate" && body.metric !== "cost_spike") || typeof body.threshold !== "number") {
+      return c.json({ error: "metric must be success_rate|cost_spike and threshold a number" }, 400);
+    }
+    const rule = await store.saveAlertRule({
+      id: newId("rule"),
+      projectId: project.id,
+      metric: body.metric,
+      threshold: body.threshold,
+      channel: body.channel ?? "webhook",
+      createdAt: new Date().toISOString(),
+    });
+    return c.json({ rule });
+  });
+
+  app.get("/v1/alerts/rules", async (c) => {
+    const { ctx, error } = await requireAuth(c);
+    if (!ctx) return error;
+    const project = await resolveProject(ctx);
+    if (!project) return c.json({ rules: [] });
+    return c.json({ rules: await store.listAlertRules(project.id) });
+  });
+
+  app.delete("/v1/alerts/rules/:id", async (c) => {
+    const { ctx, error } = await requireAuth(c);
+    if (!ctx) return error;
+    const project = await resolveProject(ctx);
+    if (!project) return c.json({ error: "not found" }, 404);
+    const ok = await store.deleteAlertRule(project.id, c.req.param("id"));
+    return ok ? c.json({ deleted: true }) : c.json({ error: "not found" }, 404);
+  });
+
+  // Spec 8.3: agent tests as first-class runs — run an eval against a chat
+  // endpoint server-side and ingest the report as a run of kind agent-test.
+  app.post("/v1/agent-tests", async (c) => {
+    const { ctx, error } = await requireAuth(c);
+    if (!ctx) return error;
+    const project = await resolveProject(ctx);
+    if (!project) return c.json({ error: "no project" }, 400);
+    const body = (await c.req.json()) as { endpoint?: string; scenarios?: number };
+    if (!body.endpoint) return c.json({ error: "endpoint required" }, 400);
+    if (body.scenarios !== undefined && (!Number.isFinite(body.scenarios) || body.scenarios < 1 || body.scenarios > 60)) {
+      return c.json({ error: "scenarios must be 1-60" }, 400);
+    }
+    try {
+      const report = await runAgentTest({ endpoint: body.endpoint, scenarios: body.scenarios });
+      const runId = report.runId;
+      await store.upsertRun({
+        id: runId,
+        projectId: project.id,
+        objective: `agent-test ${body.endpoint} (${report.turns.length} turns)`,
+        status: report.verdict === "red" ? "failed" : report.verdict === "yellow" ? "paused" : "passed",
+        startedAt: new Date().toISOString(),
+        stepCount: report.turns.length,
+        error: report.verdict === "red" ? "agent verdict red" : undefined,
+        events: report.turns.map((t, i) => ({
+          ts: new Date().toISOString(),
+          type: "decide",
+          runId,
+          stepIndex: i,
+          payload: { action: { type: "finish", success: t.pass, reason: `scenario ${t.scenarioId} turn ${t.turn}` }, reply: t.reply.slice(0, 200) },
+        })),
+      });
+      await store.replaceSpans(
+        runId,
+        report.spans.map((s, i) => ({
+          id: `${runId}_s${i}`,
+          runId,
+          kind: s.kind,
+          startedAt: s.startedAt,
+          endedAt: s.endedAt,
+          ok: s.ok,
+          error: s.error,
+          attributes: s.attributes as Record<string, unknown> | undefined,
+        })),
+      );
+      await store.addUsage({
+        id: newId("use"),
+        projectId: project.id,
+        runId,
+        kind: "run",
+        amount: 1,
+        unit: "run",
+        createdAt: new Date().toISOString(),
+      });
+      return c.json({ report, runId });
+    } catch (err) {
+      return c.json({ error: err instanceof Error ? err.message : "agent test failed" }, 502);
+    }
   });
 
   app.get("/v1/metrics/:flowId", async (c) => {

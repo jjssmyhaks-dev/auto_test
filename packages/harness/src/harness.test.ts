@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { exportPlaywrightTest, importPlaywrightTest } from "./playwright-interop.js";
-import { assertConsole, assertNetwork, emptyCapture } from "./devtools.js";
+import { assertConsole, assertNetwork, assertPageState, emptyCapture } from "./devtools.js";
 import { runAgentTest, scoreReply, verdictFromPassRate } from "./agent-test.js";
 
 describe("playwright interop", () => {
@@ -30,6 +30,14 @@ describe("devtools asserts", () => {
     expect(assertNetwork(cap, "api.example").ok).toBe(true);
     expect(assertConsole(cap, "boot").ok).toBe(true);
     expect(assertNetwork(cap, "missing").ok).toBe(false);
+  });
+});
+
+describe("page-state asserts (spec 6.4)", () => {
+  it("validates the load-time value before measuring", async () => {
+    const bad = await assertPageState({} as never, "load_time_under", "not-a-number");
+    expect(bad.ok).toBe(false);
+    expect(bad.detail).toContain("millisecond");
   });
 });
 

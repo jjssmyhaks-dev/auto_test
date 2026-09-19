@@ -26,7 +26,7 @@ export interface RunOptions {
   dryRun?: boolean;
   home?: string;
   provider?: LlmProvider;
-  pause?: (prompt: string) => Promise<string>;
+  pause?: (prompt: string, context: { runId: string }) => Promise<string>;
   captureDevtools?: boolean;
   otlp?: boolean;
   sync?: boolean;
@@ -227,7 +227,7 @@ export async function runHarness(opts: RunOptions): Promise<RunResult> {
         const humanSpan = spans.start({ runId, kind: "HUMAN", attributes: { stepIndex } });
         logger.emit("human", { reason: action.reason, prompt: action.prompt }, stepIndex);
         const pause = opts.pause ?? (opts.agent ? async () => "continue" : defaultStdinPause);
-        await pause(action.prompt ?? action.reason);
+        await pause(action.prompt ?? action.reason, { runId });
         humanSpan.end(true);
         recent.push(action);
         stepIndex += 1;

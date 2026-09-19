@@ -353,3 +353,44 @@ describe("golden flows — human-in-the-loop & self-heal (spec 1.5/1.4)", () => 
     expect(spans.some((s) => s.kind === "ACT" && (s.attributes as { healing?: boolean } | undefined)?.healing === true && s.ok === true)).toBe(true);
   }, 60_000);
 });
+
+describe("golden flows — devtools & page-state assertions (spec 6.4)", () => {
+  it("21 asserts cookies and localStorage after a state-setting page", async () => {
+    const home = newHome();
+    const result = await runHarness({
+      objective: "visit /state and verify the session cookie and theme preference are saved",
+      envUrl: `${site.url}/state`,
+      headless: true,
+      home,
+      provider: scriptedProvider([
+        { type: "assert", check: "cookie_contains", value: "session" },
+        { type: "assert", check: "local_storage", value: "theme" },
+        done("cookie and storage verified"),
+      ]),
+    });
+    expect(result.status).toBe("passed");
+    const events = readEvents(result.runId, home);
+    const asserts = events.filter((e) => e.type === "verify" && e.payload.finish !== true);
+    expect(asserts.length).toBe(2);
+    expect(asserts.every((e) => (e.payload as { ok?: boolean }).ok === true)).toBe(true);
+    expect(asserts.some((e) => (e.payload as { detail?: string }).detail?.includes("cookie session"))).toBe(true);
+  }, 60_000);
+
+  it("22 asserts page load time under a generous budget", async () => {
+    const home = newHome();
+    const result = await runHarness({
+      objective: "verify the dashboard loads fast",
+      envUrl: `${site.url}/dashboard`,
+      headless: true,
+      home,
+      provider: scriptedProvider([
+        { type: "assert", check: "load_time_under", value: "5000" },
+        done("load time within budget"),
+      ]),
+    });
+    expect(result.status).toBe("passed");
+    const events = readEvents(result.runId, home);
+    const verify = events.find((e) => e.type === "verify");
+    expect((verify?.payload as { detail?: string }).detail).toMatch(/load took \d+ms/);
+  }, 60_000);
+});
