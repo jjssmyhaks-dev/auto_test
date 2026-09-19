@@ -12,6 +12,8 @@ import {
   type PromptInputMessage,
 } from "@/components/ai-elements/prompt-input";
 import { AppPage } from "@/components/app-page";
+import { OnboardingChecklist } from "@/components/onboarding-checklist";
+import { markAction } from "@/lib/onboarding";
 
 type Run = { id: string; objective: string; status: string; startedAt: string; costUsd?: number };
 
@@ -44,6 +46,7 @@ export default function RunsPage() {
       });
       setDraft("");
       setNote(`Queued ${res.id}. Execute locally with veriflow run, then --sync.`);
+      markAction("queue_run");
       load();
       router.push(`/runs/${res.id}`);
     } catch (e) {
@@ -81,6 +84,7 @@ export default function RunsPage() {
         cli: "npx veriflow run \"sign in and reach the dashboard\"",
       }}
     >
+      <OnboardingChecklist />
       <p className="empty">
         Queue an objective here (cloud record). The browser harness still runs on the CLI — this does not start Chromium from the dashboard.
       </p>

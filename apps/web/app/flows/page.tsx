@@ -5,6 +5,7 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { api } from "@/lib/api";
 import { AppPage } from "@/components/app-page";
+import { markAction } from "@/lib/onboarding";
 
 type Flow = { id: string; name: string; objective: string; envUrl?: string };
 type Run = { id: string; flowId?: string; status: string; startedAt: string };
@@ -69,6 +70,7 @@ export default function FlowsPage() {
         body: JSON.stringify({ name: name.trim() || objective.slice(0, 60), objective, envUrl: envUrl.trim() || undefined }),
       });
       setNote("flow saved");
+      markAction("create_flow");
       setName("");
       setObjective("");
       load();

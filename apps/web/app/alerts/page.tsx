@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import { api } from "@/lib/api";
 import { AppPage } from "@/components/app-page";
+import { markAction } from "@/lib/onboarding";
 
 type Alert = { kind: string; severity: string; message: string; value?: number };
 type Rule = { id: string; metric: string; threshold: number; channel: string; lastTriggeredAt?: string };
@@ -42,6 +43,7 @@ export default function AlertsPage() {
         body: JSON.stringify({ metric, threshold: value }),
       });
       setNote(`rule saved: ${metric} @ ${value}`);
+      markAction("create_alert_rule");
       load();
     } catch (e) {
       setNote(e instanceof Error ? e.message : String(e));

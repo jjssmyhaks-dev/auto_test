@@ -105,6 +105,8 @@ export const TOUR_STEPS: TourStep[] = [
 ];
 
 const TOUR_KEY = "veriflow_tour_done";
+const TOUR_RESUME_KEY = "veriflow_tour_step";
+const TOUR_MODE_KEY = "veriflow_tour_mode";
 
 type TourApi = { start: (opts?: { interactive?: boolean }) => void };
 
@@ -121,20 +123,33 @@ export function TourGuide() {
   const vh = typeof window !== "undefined" ? window.innerHeight : 800;
 
   const start = useCallback((opts?: { interactive?: boolean }) => {
-    setIndex(0);
-    setInteractive(opts?.interactive ?? false);
+    // Resume from the persisted step unless the tour was finished cleanly.
+    const saved = Number.parseInt(localStorage.getItem(TOUR_RESUME_KEY) ?? "0", 10);
+    setIndex(Number.isFinite(saved) ? Math.max(0, Math.min(TOUR_STEPS.length - 1, saved)) : 0);
+    const savedMode = localStorage.getItem(TOUR_MODE_KEY) === "interactive";
+    setInteractive(opts?.interactive ?? savedMode);
     setActed(false);
     setActive(true);
   }, []);
 
-  // Expose start to the header buttons and auto-start for first-time visitors.
+  // Expose start to the header buttons; auto-start/resume for returning users
+  // who haven't finished the tour cleanly yet.
   useEffect(() => {
     (window as unknown as { __veriflowTour?: TourApi }).__veriflowTour = { start };
     if (typeof window !== "undefined" && !localStorage.getItem(TOUR_KEY)) {
       start();
-      localStorage.setItem(TOUR_KEY, "1");
     }
   }, [start]);
+
+  // Persist progress while the tour is open so a reload returns to this step.
+  useEffect(() => {
+    if (active) localStorage.setItem(TOUR_RESUME_KEY, String(index));
+  }, [active, index]);
+
+  // Persist the chosen mode.
+  useEffect(() => {
+    if (active) localStorage.setItem(TOUR_MODE_KEY, interactive ? "interactive" : "guided");
+  }, [active, interactive]);
 
   const targetSelector = step?.target;
   useEffect(() => {
@@ -166,9 +181,22 @@ export function TourGuide() {
     };
   }, [active, targetSelector, index]);
 
+  // Escape / backdrop = pause: progress is kept, the tour resumes on return.
+  const pause = useCallback(() => {
+    setActive(false);
+  }, []);
+
+  // Reaching the end = done: progress cleared, no more auto-starts.
   const finish = useCallback(() => {
     setActive(false);
+    localStorage.removeItem(TOUR_RESUME_KEY);
     localStorage.setItem(TOUR_KEY, "1");
+  }, []);
+
+  const restart = useCallback(() => {
+    localStorage.removeItem(TOUR_RESUME_KEY);
+    setIndex(0);
+    setActed(false);
   }, []);
 
   const go = useCallback(
@@ -223,13 +251,13 @@ export function TourGuide() {
   useEffect(() => {
     if (!active) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") finish();
+      if (e.key === "Escape") pause();
       if (e.key === "ArrowRight" && !(interactive && waitFor && !acted)) go(index + 1);
       if (e.key === "ArrowLeft") go(index - 1);
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [active, index, go, finish, interactive, waitFor, acted]);
+  }, [active, index, go, pause, interactive, waitFor, acted]);
 
   const progress = useMemo(() => `${index + 1} / ${TOUR_STEPS.length}`, [index]);
 
@@ -251,7 +279,7 @@ export function TourGuide() {
       <div
         className="fixed inset-0 z-[90] bg-background/70"
         style={{ pointerEvents: interactive ? "none" : "auto" }}
-        onClick={interactive ? undefined : finish}
+        onClick={interactive ? undefined : pause}
         role="presentation"
       />
       {box ? (
@@ -300,6 +328,14 @@ export function TourGuide() {
           >
             {interactive ? "Guided mode" : "Try it"}
           </button>
+          <button
+            type="button"
+            className="ml-2 font-mono text-[10px] uppercase"
+            onClick={restart}
+            disabled={index === 0}
+          >
+            ↺ Restart
+          </button>
           <span className="ml-auto font-mono text-[10px] uppercase text-foreground/60">
             {progress} · {pathname === step.path || (step.path === "/runs/:first" && /^\/runs\/[^/]+$/.test(pathname)) ? "here" : `→ ${step.path}`}
           </span>
@@ -309,21 +345,26 @@ export function TourGuide() {
   );
 }
 
-/** Header button: restarts the tour on demand. */
+/** Header buttons: restart or resume the tour on demand. */
 export function TourButton({ interactive = false }: { interactive?: boolean }) {
   const [mounted, setMounted] = useState(false);
-  useEffect(() => setMounted(true), []);
+  const [resumable, setResumable] = useState(false);
+  useEffect(() => {
+    setMounted(true);
+    setResumable(!!localStorage.getItem(TOUR_RESUME_KEY) && !localStorage.getItem(TOUR_KEY));
+  }, []);
   return (
     <button
       type="button"
       className="font-mono text-[10px] uppercase"
       onClick={() => {
         localStorage.removeItem(TOUR_KEY);
+        setResumable(false);
         (window as unknown as { __veriflowTour?: TourApi }).__veriflowTour?.start({ interactive });
       }}
       style={{ visibility: mounted ? "visible" : "hidden" }}
     >
-      {interactive ? "? Try it" : "? Tour"}
+      {interactive ? "? Try it" : resumable ? "? Resume tour" : "? Tour"}
     </button>
   );
 }

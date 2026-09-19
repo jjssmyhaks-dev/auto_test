@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { actionTypeOf, type TraceSpan, type TraceStep } from "@/lib/ai-trace";
+import { markAction } from "@/lib/onboarding";
 
 export interface ScrubberProps {
   steps: TraceStep[];
@@ -169,6 +170,7 @@ export function TraceScrubber({ steps, spans, screenshots }: ScrubberProps) {
         onKeyDown={(e) => {
           if (e.key === "ArrowLeft") setCursor((c) => Math.max(0, c - 1));
           if (e.key === "ArrowRight") setCursor((c) => Math.min(slices.length - 1, c + 1));
+          if (e.key === "ArrowLeft" || e.key === "ArrowRight") markAction("scrub_trace");
         }}
       >
         {slices.map((s, i) => (
@@ -176,7 +178,10 @@ export function TraceScrubber({ steps, spans, screenshots }: ScrubberProps) {
             key={s.index}
             type="button"
             title={`step ${s.index} · ${s.type} · ${s.ok === false ? "failed" : s.ok === true ? "ok" : s.status}`}
-            onClick={() => setCursor(i)}
+            onClick={() => {
+              setCursor(i);
+              markAction("scrub_trace");
+            }}
             className={`group relative h-8 min-w-4 flex-1 border-r border-foreground/15 last:border-r-0 ${
               i === cursor ? "ring-2 ring-inset ring-primary" : ""
             } ${SPAN_COLORS[s.spans[0]?.kind ?? "OBSERVE"] ?? "bg-muted"} ${s.ok === false ? "opacity-100" : "opacity-60 hover:opacity-90"}`}
