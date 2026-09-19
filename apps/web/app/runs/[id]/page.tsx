@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { useParams } from "next/navigation";
 import { api } from "@/lib/api";
 import { RunTraceView } from "@/components/run-trace-view";
+import { TraceScrubber } from "@/components/trace-scrubber";
 import { AppPage } from "@/components/app-page";
 
 type Trace = {
@@ -18,7 +19,6 @@ export default function RunDetailPage() {
   const params = useParams<{ id: string }>();
   const [trace, setTrace] = useState<Trace | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [shot, setShot] = useState(0);
 
   useEffect(() => {
     if (!params.id) return;
@@ -49,29 +49,8 @@ export default function RunDetailPage() {
         {trace.run.error ? ` — ${trace.run.error}` : ""}
       </p>
       <RunTraceView objective={trace.run.objective} steps={trace.steps} spans={trace.spans} />
-      {trace.screenshots.length > 0 ? (
-        <>
-          <h2>Screenshots</h2>
-          <div className="row">
-            <button type="button" onClick={() => setShot((s) => Math.max(0, s - 1))}>
-              Prev
-            </button>
-            <span>
-              {shot + 1} / {trace.screenshots.length}
-            </span>
-            <button
-              type="button"
-              onClick={() => setShot((s) => Math.min(trace.screenshots.length - 1, s + 1))}
-            >
-              Next
-            </button>
-          </div>
-          {/* eslint-disable-next-line @next/next/no-img-element */}
-          <img className="shot" src={trace.screenshots[shot]} alt={`step ${shot}`} />
-        </>
-      ) : (
-        <p className="empty">No screenshots uploaded with this run.</p>
-      )}
+      <h2>Scrubber</h2>
+      <TraceScrubber steps={trace.steps} spans={trace.spans} screenshots={trace.screenshots} />
       {trace.capture?.network?.length ? (
         <>
           <h2>Network</h2>

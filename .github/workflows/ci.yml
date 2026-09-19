@@ -1,0 +1,107 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Playwright Chromium (for the golden-flow suite)
+        run: pnpm playwright:install
+
+      - name: Typecheck (all workspaces)
+        run: pnpm typecheck
+
+      - name: Build packages
+        run: pnpm --filter "./packages/*" build
+
+      - name: Unit + golden-flow tests
+        run: pnpm test
+
+      - name: Build web dashboard
+        run: pnpm --filter @veriflow/web build
+
+  api-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build workspace packages (API imports their dist output)
+        run: pnpm --filter "./packages/*" build
+
+      - name: Build API
+        run: pnpm --filter @veriflow/api build
+
+      - name: Start API
+        working-directory: apps/api
+        env:
+          PORT: 8787
+        run: |
+          node dist/index.js &
+          echo $! > /tmp/veriflow-api.pid
+
+      - name: Smoke /health and /openapi.json
+        run: |
+          for i in $(seq 1 30); do
+            code=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8787/health || true)
+            [ "$code" = "200" ] && break
+            sleep 1
+          done
+          echo "health status: $code"
+          test "$code" = "200"
+          curl -sf http://127.0.0.1:8787/health | grep -q '"ok":true'
+          curl -sf http://127.0.0.1:8787/openapi.json | grep -q '"/v1/runs/{id}/trace"'
+
+      - name: Smoke auth + run ingest/read round-trip
+        run: |
+          set -e
+          token=$(curl -sf -X POST http://127.0.0.1:8787/v1/auth/signup \
+            -H 'content-type: application/json' \
+            -d '{"email":"ci@veriflow.test","password":"ci-password-123"}' \
+            | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).token))')
+          test -n "$token"
+          run_id=$(curl -sf -X POST http://127.0.0.1:8787/v1/runs \
+            -H "authorization: Bearer $token" \
+            -H 'content-type: application/json' \
+            -d '{"objective":"ci smoke","status":"passed","events":[]}' \
+            | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).id))')
+          test -n "$run_id"
+          curl -sf http://127.0.0.1:8787/v1/runs/$run_id -H "authorization: Bearer $token" \
+            | grep -q '"objective":"ci smoke"'
+
+      - name: Stop API
+        if: always()
+        run: |
+          if [ -f /tmp/veriflow-api.pid ]; then kill "$(cat /tmp/veriflow-api.pid)" || true; fi

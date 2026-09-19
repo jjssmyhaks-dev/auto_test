@@ -93,6 +93,12 @@ export async function runHarness(opts: RunOptions): Promise<RunResult> {
   let nodes: A11yNode[] = [];
   let stepIndex = 0;
   let capture: DevtoolsCapture = emptyCapture();
+  // Self-heal state (spec 1.5): on ACT failure, re-observe and re-decide with the
+  // failure appended to context — capped so a broken flow still fails.
+  const HEAL_RETRIES = 2;
+  let healCount = 0;
+  let healing = false;
+  let lastFailure: string | undefined;
   const progress = (line: string) => {
     if (!opts.agent) opts.progress?.(line);
   };
@@ -134,7 +140,7 @@ export async function runHarness(opts: RunOptions): Promise<RunResult> {
         break;
       }
 
-      const observeSpan = spans.start({ runId, kind: "OBSERVE" });
+      const observeSpan = spans.start({ runId, kind: "OBSERVE", attributes: { stepIndex } });
       const observed = await observePage(page);
       nodes = observed.a11y.nodes;
       const shotPath = join(rp.screenshots, `step-${stepIndex}.png`);
@@ -154,9 +160,11 @@ export async function runHarness(opts: RunOptions): Promise<RunResult> {
       observeSpan.end(true);
       progress(`▸ step ${stepIndex} observe ${safeUrl}`);
 
-      const decideSpan = spans.start({ runId, kind: "DECIDE" });
+      const decideSpan = spans.start({ runId, kind: "DECIDE", attributes: { stepIndex, healing } });
       const decideInput = {
-        objective: opts.objective,
+        objective: healing
+          ? `${opts.objective}\nYour previous action failed: ${lastFailure}. Re-observe and try a different approach.`
+          : opts.objective,
         url: observed.url,
         a11yTree: redactSecrets(observed.a11y.tree, secrets),
         screenshotPng: observed.screenshotPng,
@@ -188,7 +196,7 @@ export async function runHarness(opts: RunOptions): Promise<RunResult> {
       logger.emit("decide", { action: redactDeep(action, secrets) }, stepIndex, decideSpan.span.id);
       progress(`▸ step ${stepIndex} decide ${action.type}`);
 
-      const guardSpan = spans.start({ runId, kind: "GUARD" });
+      const guardSpan = spans.start({ runId, kind: "GUARD", attributes: { stepIndex } });
       const verdict = evaluateGuards({
         action,
         stepCount: stepIndex,
@@ -203,6 +211,7 @@ export async function runHarness(opts: RunOptions): Promise<RunResult> {
         costCapUsd: config.costCapUsd,
         allowDestructive: Boolean(opts.yesIMeanIt),
         dryRun: Boolean(opts.dryRun),
+        observedNodes: nodes,
       });
       logger.emit("guard", verdict, stepIndex, guardSpan.span.id);
       if (!verdict.ok) {
@@ -215,7 +224,7 @@ export async function runHarness(opts: RunOptions): Promise<RunResult> {
       guardSpan.end(true);
 
       if (action.type === "request_human") {
-        const humanSpan = spans.start({ runId, kind: "HUMAN" });
+        const humanSpan = spans.start({ runId, kind: "HUMAN", attributes: { stepIndex } });
         logger.emit("human", { reason: action.reason, prompt: action.prompt }, stepIndex);
         const pause = opts.pause ?? (opts.agent ? async () => "continue" : defaultStdinPause);
         await pause(action.prompt ?? action.reason);
@@ -237,46 +246,55 @@ export async function runHarness(opts: RunOptions): Promise<RunResult> {
       let actOk = true;
       let actDetail = "";
       if (!opts.dryRun) {
-        let attempts = 0;
-        while (attempts <= 2) {
-          const kind = attempts === 0 ? "ACT" : "RETRY";
-          const actSpan = spans.start({ runId, kind });
-          try {
-            const result = await performAction(page, action, nodes, (a) => resolveFill(vault, a));
-            actOk = result.ok;
-            actDetail = result.detail;
-            actSpan.end(true, undefined, { detail: actDetail, attempt: attempts });
-            logger.emit(attempts === 0 ? "act" : "retry", { ok: true, detail: actDetail, attempt: attempts }, stepIndex);
-            break;
-          } catch (err) {
-            actOk = false;
-            actDetail = err instanceof Error ? err.message : String(err);
-            actSpan.end(false, actDetail, { attempt: attempts });
-            logger.emit(attempts === 0 ? "act" : "retry", { ok: false, detail: actDetail, attempt: attempts }, stepIndex);
-            attempts += 1;
-            if (attempts > 2) break;
-            const reobs = spans.start({ runId, kind: "OBSERVE" });
-            const again = await observePage(page);
-            nodes = again.a11y.nodes;
-            reobs.end(true);
+        const actSpan = spans.start({ runId, kind: "ACT", attributes: { stepIndex, healing } });
+        try {
+          const result = await performAction(page, action, nodes, (a) => resolveFill(vault, a));
+          if (!result.ok) throw new Error(result.detail);
+          actDetail = result.detail;
+          actSpan.end(true, undefined, { detail: actDetail });
+          logger.emit("act", { ok: true, detail: actDetail }, stepIndex);
+          if (healing) {
+            logger.emit("retry", { ok: true, healed: true, detail: actDetail }, stepIndex);
+            healing = false;
+            lastFailure = undefined;
           }
+        } catch (err) {
+          actOk = false;
+          actDetail = err instanceof Error ? err.message : String(err);
+          actSpan.end(false, actDetail);
+          logger.emit("act", { ok: false, detail: actDetail }, stepIndex);
+          healCount += 1;
+          if (healCount > HEAL_RETRIES) {
+            status = "failed";
+            error = `self-heal exhausted after ${HEAL_RETRIES} retries: ${actDetail}`;
+            break;
+          }
+          // Spec 1.5: re-observe, then loop back to DECIDE with the failure in context.
+          const reobs = spans.start({ runId, kind: "OBSERVE", attributes: { stepIndex, heal: true } });
+          const again = await observePage(page);
+          nodes = again.a11y.nodes;
+          reobs.end(true);
+          logger.emit("retry", { ok: false, detail: actDetail, healing: true }, stepIndex);
+          healing = true;
+          lastFailure = actDetail;
+          continue;
         }
       } else {
         logger.emit("act", { ok: true, dryRun: true, action: redactDeep(action, secrets) }, stepIndex);
       }
 
-      const verifySpan = spans.start({ runId, kind: "VERIFY" });
+      const verifySpan = spans.start({ runId, kind: "VERIFY", attributes: { stepIndex } });
       if (action.type === "assert") {
         const v = opts.dryRun ? { ok: true, detail: "dry-run" } : await verifyAction(page, action, capture);
         logger.emit("verify", v, stepIndex);
-        verifySpan.end(v.ok, v.ok ? undefined : v.detail);
+        verifySpan.end(v.ok, v.ok ? undefined : v.detail, { detail: v.detail });
         if (!v.ok) {
           status = "failed";
           error = `assert failed: ${v.detail}`;
           break loop;
         }
       } else {
-        verifySpan.end(actOk, actOk ? undefined : actDetail);
+        verifySpan.end(actOk, actOk ? undefined : actDetail, { detail: actDetail });
         if (!actOk) {
           status = "failed";
           error = actDetail;

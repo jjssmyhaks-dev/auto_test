@@ -1,4 +1,5 @@
 import type { Action } from "@veriflow/schema";
+import type { A11yNode } from "./a11y.js";
 
 const DESTRUCTIVE_RE =
   /\b(delete|remove account|destroy|purchase|buy now|pay now|confirm order|transfer funds|wipe)\b/i;
@@ -20,10 +21,20 @@ export function detectActionLoop(recent: Action[], abortCount = 3): boolean {
   return tail.every((k) => k === tail[0]);
 }
 
-export function isDestructive(action: Action): boolean {
+/**
+ * Destructive-action detection: checks the action JSON plus, for ref targets,
+ * the element's accessible name from the current observation (spec 1.4:
+ * "keywords in the objective or the visible button text").
+ */
+export function isDestructive(action: Action, nodes: A11yNode[] = []): boolean {
   if (action.type === "click" && action.destructive) return true;
-  const blob = JSON.stringify(action);
-  return DESTRUCTIVE_RE.test(blob);
+  const parts: string[] = [JSON.stringify(action)];
+  const ref = "target" in action && action.target?.ref ? action.target.ref.replace(/^@/, "") : undefined;
+  if (ref) {
+    const node = nodes.find((n) => n.ref === ref);
+    if (node?.name) parts.push(node.name);
+  }
+  return DESTRUCTIVE_RE.test(parts.join(" "));
 }
 
 export interface GuardInput {
@@ -32,6 +43,8 @@ export interface GuardInput {
   stepCap: number;
   recentActions: Action[];
   loopAbortCount: number;
+  /** Current observation, used to resolve ref targets to visible names. */
+  observedNodes?: A11yNode[];
   elapsedMs: number;
   wallClockMs: number;
   tokensUsed: number;
@@ -74,7 +87,7 @@ export function evaluateGuards(input: GuardInput): GuardVerdict {
       message: `Same action repeated ${input.loopAbortCount} times`,
     };
   }
-  if (isDestructive(input.action) && !input.allowDestructive && !input.dryRun) {
+  if (isDestructive(input.action, input.observedNodes ?? []) && !input.allowDestructive && !input.dryRun) {
     return {
       ok: false,
       code: "destructive",

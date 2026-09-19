@@ -95,7 +95,11 @@ async function locatorFor(page: Page, target: Target | undefined, nodes: A11yNod
   if (target.ref) {
     const ref = target.ref.replace(/^@/, "");
     const node = nodes.find((n) => n.ref === target.ref || n.ref === ref);
-    if (node?.selector) return page.locator(node.selector).first();
+    // Strict ref resolution: an unresolvable ref means the page drifted from the
+    // observation — fail fast so the harness re-observes and retries (self-heal),
+    // instead of silently clicking <body>.
+    if (!node?.selector) throw new Error(`target ref ${target.ref} not found in current observation`);
+    return page.locator(node.selector).first();
   }
   if (target.selector) return page.locator(target.selector).first();
   if (target.text) return page.getByText(target.text, { exact: false }).first();
