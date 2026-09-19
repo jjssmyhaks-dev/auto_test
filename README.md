@@ -2,6 +2,8 @@
 
 Local-first **vision browser testing**. The CLI (`veriflow`) drives Chromium with Playwright, asks a vision LLM for the next constrained action, enforces guardrails, redacts secrets, and writes a local evidence pack. Cloud API, dashboard, MCP, Playwright interop, chat agent-tests, and billing quotas are implemented for local use.
 
+> 📄 **Reports**: [Product report & user guide](docs/product-report.md) — what Veriflow does and how to use it · [Engineering report](docs/engineering-report.md) — architecture, data model, conventions, and roadmap for the build team.
+
 ## Requirements
 
 - Node.js 20+
