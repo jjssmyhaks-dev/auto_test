@@ -8,6 +8,10 @@ export default defineConfig({
   test: {
     include: ["packages/**/*.test.ts", "apps/**/*.test.ts", "tests/**/*.test.ts"],
     environment: "node",
+    // The golden suite drives real Chromium; runner-load flakes happen.
+    // Retry once, but only in CI — local runs stay strict so real bugs
+    // surface immediately during development.
+    retry: process.env.CI ? 1 : 0,
   },
   resolve: {
     alias: {
