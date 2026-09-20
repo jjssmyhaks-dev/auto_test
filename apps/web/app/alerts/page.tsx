@@ -17,6 +17,7 @@ export default function AlertsPage() {
   const [threshold, setThreshold] = useState("0.8");
   const [channel, setChannel] = useState("slack:");
   const [note, setNote] = useState<string | null>(null);
+  const [testResult, setTestResult] = useState<string | null>(null);
 
   function load() {
     api<{ alerts: Alert[]; rules?: Rule[]; delivery: string }>('/v1/alerts')
@@ -57,6 +58,28 @@ export default function AlertsPage() {
       load();
     } catch (e) {
       setNote(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  async function sendTest() {
+    setTestResult(null);
+    try {
+      const res = await api<{
+        result: { status: string; kind: string; attempts: number; error?: string };
+      }>("/v1/alerts/test", {
+        method: "POST",
+        body: JSON.stringify({ channel }),
+      });
+      const r = res.result;
+      setTestResult(
+        r.status === "delivered"
+          ? `Delivered to ${r.kind} after ${r.attempts} attempt${r.attempts === 1 ? "" : "s"}.`
+          : r.status === "skipped"
+            ? `Skipped — ${r.error ?? "channel not configured"}`
+            : `Failed — ${r.error ?? "unknown error"} (after ${r.attempts} attempts)`,
+      );
+    } catch (e) {
+      setTestResult(e instanceof Error ? e.message : String(e));
     }
   }
 
@@ -158,6 +181,11 @@ export default function AlertsPage() {
       <button type="button" onClick={addRule}>
         Add rule
       </button>
+      {" "}
+      <button type="button" className="secondary" onClick={sendTest}>
+        Send test notification
+      </button>
+      {testResult ? <p className="empty">Test: {testResult}</p> : null}
       {note ? <p className="empty">{note}</p> : null}
     </AppPage>
   );

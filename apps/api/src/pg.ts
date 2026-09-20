@@ -1,6 +1,6 @@
 import pg from "pg";
 import type { BillingTier } from "@veriflow/schema";
-import { newId, type AlertRuleRow, type ApiKeyRow, type DeviceJobRow, type DeviceRow, type FlowRow, type HumanPauseRow, type InviteRow, type MemberRow, type MetricRollupRow, type ProjectRole, type ProjectRow, type RunRow, type SpanRow, type StepRow, type UsageRow, type UserProgressRow, type UserRow } from "./auth.js";
+import { newId, effectiveRole, type AlertRuleRow, type ApiKeyRow, type DeviceJobRow, type DeviceRow, type FlowRow, type HumanPauseRow, type InviteRow, type MemberRow, type MetricRollupRow, type ProjectRole, type ProjectRow, type RunRow, type SpanRow, type StepRow, type UsageRow, type UserProgressRow, type UserRow, type WorkspaceInviteRow, type WorkspaceMemberRow, type WorkspaceRow } from "./auth.js";
 import { SESSION_TTL_MS, type CloudStore } from "./store.js";
 
 const DDL = `
@@ -38,6 +38,31 @@ CREATE TABLE IF NOT EXISTS projects (
   id TEXT PRIMARY KEY,
   user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   name TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS workspaces (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS workspace_members (
+  workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  role TEXT NOT NULL,
+  added_by TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (workspace_id, user_id)
+);
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS workspace_id TEXT REFERENCES workspaces(id) ON DELETE SET NULL;
+CREATE TABLE IF NOT EXISTS workspace_invites (
+  id TEXT PRIMARY KEY,
+  workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+  email TEXT NOT NULL,
+  role TEXT NOT NULL,
+  token TEXT NOT NULL UNIQUE,
+  status TEXT NOT NULL DEFAULT 'pending',
+  invited_by TEXT NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE TABLE IF NOT EXISTS api_keys (
@@ -298,7 +323,7 @@ export class PgStore implements CloudStore {
       [id, userId, name],
     );
     const r = res.rows[0];
-    return { id: r.id, userId: r.user_id, name: r.name, createdAt: new Date(r.created_at).toISOString() };
+    return { id: r.id, userId: r.user_id, name: r.name, workspaceId: r.workspace_id ?? undefined, createdAt: new Date(r.created_at).toISOString() };
   }
   async listProjects(userId: string) {
     const res = await this.pool.query(`SELECT * FROM projects WHERE user_id=$1`, [userId]);
@@ -306,6 +331,7 @@ export class PgStore implements CloudStore {
       id: r.id,
       userId: r.user_id,
       name: r.name,
+      workspaceId: r.workspace_id ?? undefined,
       createdAt: new Date(r.created_at).toISOString(),
     }));
   }
@@ -313,7 +339,7 @@ export class PgStore implements CloudStore {
     const res = await this.pool.query(`SELECT * FROM projects WHERE id=$1`, [id]);
     const r = res.rows[0];
     if (!r) return undefined;
-    return { id: r.id, userId: r.user_id, name: r.name, createdAt: new Date(r.created_at).toISOString() };
+    return { id: r.id, userId: r.user_id, name: r.name, workspaceId: r.workspace_id ?? undefined, createdAt: new Date(r.created_at).toISOString() };
   }
   async addMember(row: MemberRow) {
     await this.pool.query(
@@ -369,6 +395,148 @@ export class PgStore implements CloudStore {
     );
     return res.rows[0]?.role as ProjectRole | undefined;
   }
+  async effectiveRoleFor(projectId: string, userId: string) {
+    const projectRole = await this.roleFor(projectId, userId);
+    const res = await this.pool.query(
+      `SELECT CASE WHEN w.user_id = $2 THEN 'owner' ELSE wm.role END AS role
+       FROM projects p
+       JOIN workspaces w ON w.id = p.workspace_id
+       LEFT JOIN workspace_members wm ON wm.workspace_id = w.id AND wm.user_id = $2
+       WHERE p.id = $1`,
+      [projectId, userId],
+    );
+    const wsRole = res.rows[0]?.role as ProjectRole | undefined;
+    return effectiveRole(wsRole, projectRole);
+  }
+  async createWorkspace(userId: string, name: string) {
+    const id = newId("ws");
+    const res = await this.pool.query(
+      `INSERT INTO workspaces (id, user_id, name) VALUES ($1,$2,$3) RETURNING *`,
+      [id, userId, name],
+    );
+    const r = res.rows[0];
+    return { id: r.id, userId: r.user_id, name: r.name, createdAt: new Date(r.created_at).toISOString() };
+  }
+  async listWorkspaces(userId: string) {
+    const res = await this.pool.query(
+      `SELECT DISTINCT w.* FROM workspaces w
+       LEFT JOIN workspace_members wm ON wm.workspace_id = w.id AND wm.user_id = $1
+       WHERE w.user_id = $1 OR wm.user_id = $1
+       ORDER BY w.created_at`,
+      [userId],
+    );
+    return res.rows.map((r) => ({
+      id: r.id,
+      userId: r.user_id,
+      name: r.name,
+      createdAt: new Date(r.created_at).toISOString(),
+    }));
+  }
+  async getWorkspace(id: string) {
+    const res = await this.pool.query(`SELECT * FROM workspaces WHERE id=$1`, [id]);
+    const r = res.rows[0];
+    if (!r) return undefined;
+    return { id: r.id, userId: r.user_id, name: r.name, createdAt: new Date(r.created_at).toISOString() };
+  }
+  async addWorkspaceMember(row: WorkspaceMemberRow) {
+    await this.pool.query(
+      `INSERT INTO workspace_members (workspace_id, user_id, role, added_by)
+       VALUES ($1,$2,$3,$4)
+       ON CONFLICT (workspace_id, user_id) DO UPDATE SET role = EXCLUDED.role`,
+      [row.workspaceId, row.userId, row.role, row.addedBy],
+    );
+    return row;
+  }
+  async listWorkspaceMembers(workspaceId: string) {
+    const res = await this.pool.query(
+      `SELECT wm.*, u.email FROM workspace_members wm
+       JOIN users u ON u.id = wm.user_id
+       WHERE wm.workspace_id = $1 ORDER BY wm.created_at`,
+      [workspaceId],
+    );
+    return res.rows.map((r) => ({
+      workspaceId: r.workspace_id,
+      userId: r.user_id,
+      role: r.role,
+      addedBy: r.added_by,
+      email: r.email,
+      createdAt: new Date(r.created_at).toISOString(),
+    }));
+  }
+  async removeWorkspaceMember(workspaceId: string, userId: string) {
+    const res = await this.pool.query(
+      `DELETE FROM workspace_members WHERE workspace_id=$1 AND user_id=$2`,
+      [workspaceId, userId],
+    );
+    return (res.rowCount ?? 0) > 0;
+  }
+  async setWorkspaceMemberRole(workspaceId: string, userId: string, role: ProjectRole) {
+    const res = await this.pool.query(
+      `UPDATE workspace_members SET role=$3 WHERE workspace_id=$1 AND user_id=$2 RETURNING *`,
+      [workspaceId, userId, role],
+    );
+    const r = res.rows[0];
+    if (!r) return undefined;
+    return {
+      workspaceId: r.workspace_id,
+      userId: r.user_id,
+      role: r.role,
+      addedBy: r.added_by,
+      createdAt: new Date(r.created_at).toISOString(),
+    };
+  }
+  async createWorkspaceInvite(row: WorkspaceInviteRow) {
+    await this.pool.query(
+      `INSERT INTO workspace_invites (id, workspace_id, email, role, token, status, invited_by) VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+      [row.id, row.workspaceId, row.email, row.role, row.token, row.status, row.invitedBy],
+    );
+    return row;
+  }
+  async getWorkspaceInviteByToken(token: string) {
+    const res = await this.pool.query(`SELECT * FROM workspace_invites WHERE token=$1 AND status='pending'`, [token]);
+    return res.rows[0] ? this.mapWorkspaceInvite(res.rows[0]) : undefined;
+  }
+  async acceptWorkspaceInvite(token: string, userId: string) {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const res = await client.query(
+        `SELECT * FROM workspace_invites WHERE token=$1 AND status='pending' FOR UPDATE`,
+        [token],
+      );
+      const r = res.rows[0];
+      if (!r) {
+        await client.query("COMMIT");
+        return undefined;
+      }
+      await client.query(`UPDATE workspace_invites SET status='accepted' WHERE id=$1`, [r.id]);
+      await client.query(
+        `INSERT INTO workspace_members (workspace_id, user_id, role, added_by) VALUES ($1,$2,$3,$4)
+         ON CONFLICT (workspace_id, user_id) DO UPDATE SET role = EXCLUDED.role`,
+        [r.workspace_id, userId, r.role, r.invited_by],
+      );
+      await client.query("COMMIT");
+      return this.mapWorkspaceInvite({ ...r, status: "accepted" });
+    } catch (err) {
+      await client.query("ROLLBACK").catch(() => {});
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+  private mapWorkspaceInvite(r: Record<string, unknown>): WorkspaceInviteRow {
+    return {
+      id: r.id as string,
+      workspaceId: r.workspace_id as string,
+      email: r.email as string,
+      role: r.role as WorkspaceInviteRow["role"],
+      token: r.token as string,
+      status: r.status as WorkspaceInviteRow["status"],
+      invitedBy: r.invited_by as string,
+      createdAt: new Date(r.created_at as string).toISOString(),
+    };
+  }
+
   async createInvite(row: InviteRow) {
     await this.pool.query(
       `INSERT INTO project_invites (id, project_id, email, role, token, status, invited_by) VALUES ($1,$2,$3,$4,$5,$6,$7)`,
@@ -578,6 +746,33 @@ export class PgStore implements CloudStore {
     const res = await this.pool.query(`SELECT * FROM usage_ledger WHERE project_id=$1 ORDER BY created_at DESC`, [
       projectId,
     ]);
+    return res.rows.map((r) => ({
+      id: r.id,
+      projectId: r.project_id,
+      runId: r.run_id ?? undefined,
+      kind: r.kind,
+      amount: Number(r.amount),
+      unit: r.unit,
+      createdAt: new Date(r.created_at).toISOString(),
+    }));
+  }
+  async setProjectWorkspace(projectId: string, workspaceId: string | undefined) {
+    const res = await this.pool.query(
+      `UPDATE projects SET workspace_id=$2 WHERE id=$1 RETURNING *`,
+      [projectId, workspaceId ?? null],
+    );
+    const r = res.rows[0];
+    if (!r) return undefined;
+    return { id: r.id, userId: r.user_id, name: r.name, workspaceId: r.workspace_id ?? undefined, createdAt: new Date(r.created_at).toISOString() };
+  }
+  async listUsageByWorkspace(workspaceId: string) {
+    const res = await this.pool.query(
+      `SELECT u.* FROM usage_ledger u
+       JOIN projects p ON p.id = u.project_id
+       WHERE p.workspace_id = $1
+       ORDER BY u.created_at DESC`,
+      [workspaceId],
+    );
     return res.rows.map((r) => ({
       id: r.id,
       projectId: r.project_id,

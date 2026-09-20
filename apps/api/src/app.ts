@@ -1,10 +1,11 @@
+import { randomUUID } from "node:crypto";
 import { Hono, type Context } from "hono";
 import { cors } from "hono/cors";
 import { TIER_QUOTAS, type BillingTier, type Span } from "@veriflow/schema";
 import { spansToOtlp } from "@veriflow/telemetry";
 import { runAgentTest, runRedTeam, parseCron, compareSteps, verifyStripeSignature } from "@veriflow/harness";
 import { rateLimit, SESSION_TTL_MS } from "./store.js";
-import { ROLE_RANK, type MetricRollupRow, type ProjectRole } from "./auth.js";
+import { ROLE_RANK, WORKSPACE_ROLE_RANK, type MetricRollupRow, type ProjectRole, type WorkspaceInviteRow, type WorkspaceRole } from "./auth.js";
 import {
   hashPassword,
   hashToken,
@@ -259,8 +260,24 @@ export function createApp(deps?: Partial<AppDeps>) {
   const requireRole = async (c: Context, projectId: string, min: ProjectRole) => {
     const { ctx } = await requireAuth(c);
     if (!ctx) return c.json({ error: "unauthorized" }, 401);
-    const role = await store.roleFor(projectId, ctx.user.id);
+    // Cross-project: workspace roles act as a floor on every contained project.
+    const role = await store.effectiveRoleFor(projectId, ctx.user.id);
     if (!role) return c.json({ error: "not a member of this project" }, 403);
+    if (ROLE_RANK[role] < ROLE_RANK[min]) return c.json({ error: `requires ${min} role` }, 403);
+    return undefined;
+  };
+
+  /** Same ladder for workspace-level routes. */
+  const requireWorkspaceRole = async (c: Context, workspaceId: string, min: ProjectRole) => {
+    const { ctx } = await requireAuth(c);
+    if (!ctx) return c.json({ error: "unauthorized" }, 401);
+    const ws = await store.getWorkspace(workspaceId);
+    if (!ws) return c.json({ error: "not found" }, 404);
+    const role: ProjectRole | undefined =
+      ws.userId === ctx.user.id
+        ? "owner"
+        : (await store.listWorkspaceMembers(workspaceId)).find((m) => m.userId === ctx.user.id)?.role;
+    if (!role) return c.json({ error: "not a member of this workspace" }, 403);
     if (ROLE_RANK[role] < ROLE_RANK[min]) return c.json({ error: `requires ${min} role` }, 403);
     return undefined;
   };
@@ -322,8 +339,8 @@ export function createApp(deps?: Partial<AppDeps>) {
     if (ctx.project) return ctx.project;
     if (projectId) {
       const p = await store.getProject(projectId);
-      // Membership-aware: owner or any listed member can resolve the project.
-      if (p && (p.userId === ctx.user.id || (await store.roleFor(p.id, ctx.user.id)))) return p;
+      // Membership-aware (incl. workspace floor): owner or any effective role can resolve.
+      if (p && (p.userId === ctx.user.id || (await store.effectiveRoleFor(p.id, ctx.user.id)))) return p;
     }
     const list = await store.listProjects(ctx.user.id);
     return list[0];
@@ -441,12 +458,23 @@ export function createApp(deps?: Partial<AppDeps>) {
 
   // Accept an invite: one-time token → membership. Works for existing accounts
   // (must be signed in) or brand-new signups (the web login page passes the
-  // token through ?invite= and accepts right after signup/login).
+  // token through ?invite= and accepts right after signup/login). Handles both
+  // project invites and workspace invites.
   app.post("/v1/invites/accept", async (c) => {
     const { ctx, error } = await requireAuth(c);
     if (!ctx) return error;
     const body = (await c.req.json()) as { token?: string };
     if (!body.token) return c.json({ error: "token required" }, 400);
+    // Try a workspace invite first, then a project invite.
+    const wsInvite = await store.getWorkspaceInviteByToken(body.token);
+    if (wsInvite) {
+      if (wsInvite.email.toLowerCase() !== ctx.user.email.toLowerCase()) {
+        return c.json({ error: `invite was sent to ${wsInvite.email}` }, 403);
+      }
+      const accepted = await store.acceptWorkspaceInvite(body.token, ctx.user.id);
+      if (!accepted) return c.json({ error: "invite not found or no longer pending" }, 404);
+      return c.json({ workspaceId: accepted.workspaceId, role: accepted.role });
+    }
     const invite = await store.getInviteByToken(body.token);
     if (!invite) return c.json({ error: "invite not found or no longer pending" }, 404);
     if (invite.email.toLowerCase() !== ctx.user.email.toLowerCase()) {
@@ -491,6 +519,150 @@ export function createApp(deps?: Partial<AppDeps>) {
     }
     const updated = await store.setMemberRole(project.id, targetId, body.role);
     return updated ? c.json({ member: updated }) : c.json({ error: "not found" }, 404);
+  });
+
+  // ---- Workspaces: a layer above projects --------------------------------
+  // A workspace groups projects; its role ladder (owner > admin > member >
+  // viewer) acts as a FLOOR on every contained project via effectiveRoleFor.
+  // Member adds are direct (by account email) — no invite flow here.
+
+  app.post("/v1/workspaces", async (c) => {
+    const { ctx, error } = await requireAuth(c);
+    if (!ctx) return error;
+    const body = (await c.req.json()) as { name?: string };
+    if (!body.name?.trim()) return c.json({ error: "name required" }, 400);
+    const ws = await store.createWorkspace(ctx.user.id, body.name.trim());
+    return c.json({ workspace: ws }, 201);
+  });
+
+  app.get("/v1/workspaces", async (c) => {
+    const { ctx, error } = await requireAuth(c);
+    if (!ctx) return error;
+    return c.json({ workspaces: await store.listWorkspaces(ctx.user.id) });
+  });
+
+  app.get("/v1/workspaces/:id/members", async (c) => {
+    const denied = await requireWorkspaceRole(c, c.req.param("id"), "viewer");
+    if (denied) return denied;
+    const ws = (await store.getWorkspace(c.req.param("id")))!;
+    const owner = await store.getUser(ws.userId);
+    return c.json({
+      members: [
+        { workspaceId: ws.id, userId: ws.userId, role: "owner", addedBy: ws.userId, email: owner?.email, createdAt: ws.createdAt },
+        ...(await store.listWorkspaceMembers(ws.id)).filter((m) => m.userId !== ws.userId),
+      ],
+    });
+  });
+
+  app.post("/v1/workspaces/:id/members", async (c) => {
+    const { ctx, error } = await requireAuth(c);
+    if (!ctx) return error;
+    const denied = await requireWorkspaceRole(c, c.req.param("id"), "admin");
+    if (denied) return denied;
+    const ws = (await store.getWorkspace(c.req.param("id")))!;
+    const body = (await c.req.json()) as { email?: string; role?: ProjectRole };
+    if (!body.email || !body.role || body.role === "owner" || !(body.role in ROLE_RANK)) {
+      return c.json({ error: "email and role (admin|member|viewer) required" }, 400);
+    }
+    const target = await store.getUserByEmail(body.email);
+    if (!target) return c.json({ error: "no account with that email" }, 404);
+    const member = await store.addWorkspaceMember({
+      workspaceId: ws.id,
+      userId: target.id,
+      role: body.role,
+      addedBy: ctx.user.id,
+      createdAt: new Date().toISOString(),
+    });
+    return c.json({ member: { ...member, email: target.email } }, 201);
+  });
+
+  app.patch("/v1/workspaces/:id/members/:userId", async (c) => {
+    const denied = await requireWorkspaceRole(c, c.req.param("id"), "admin");
+    if (denied) return denied;
+    const ws = (await store.getWorkspace(c.req.param("id")))!;
+    const targetId = c.req.param("userId");
+    if (targetId === ws.userId) return c.json({ error: "cannot change the workspace owner's role" }, 400);
+    const body = (await c.req.json()) as { role?: ProjectRole };
+    if (!body.role || body.role === "owner" || !(body.role in ROLE_RANK)) {
+      return c.json({ error: "role must be admin|member|viewer" }, 400);
+    }
+    const updated = await store.setWorkspaceMemberRole(ws.id, targetId, body.role);
+    return updated ? c.json({ member: updated }) : c.json({ error: "not found" }, 404);
+  });
+
+  app.delete("/v1/workspaces/:id/members/:userId", async (c) => {
+    const denied = await requireWorkspaceRole(c, c.req.param("id"), "admin");
+    if (denied) return denied;
+    const ws = (await store.getWorkspace(c.req.param("id")))!;
+    if (c.req.param("userId") === ws.userId) return c.json({ error: "cannot remove the workspace owner" }, 400);
+    const removed = await store.removeWorkspaceMember(ws.id, c.req.param("userId"));
+    return removed ? c.json({ status: "removed" }) : c.json({ error: "not found" }, 404);
+  });
+
+  app.post("/v1/workspaces/:id/projects", async (c) => {
+    const denied = await requireWorkspaceRole(c, c.req.param("id"), "admin");
+    if (denied) return denied;
+    const body = (await c.req.json()) as { projectId?: string };
+    const project = body.projectId ? await store.getProject(body.projectId) : undefined;
+    if (!project) return c.json({ error: "projectId not found" }, 404);
+    // Only the project owner (or a workspace admin who owns it) may attach.
+    const { ctx } = await requireAuth(c);
+    if (!ctx) return c.json({ error: "unauthorized" }, 401);
+    if (project.userId !== ctx.user.id) return c.json({ error: "only the project owner can attach it" }, 403);
+    const updated = await store.setProjectWorkspace(project.id, c.req.param("id"));
+    return c.json({ project: updated });
+  });
+
+  /** Mint a one-time workspace invite (admin+ only). */
+  app.post("/v1/workspaces/:id/invites", async (c) => {
+    const denied = await requireWorkspaceRole(c, c.req.param("id"), "admin");
+    if (denied) return denied;
+    const body = (await c.req.json()) as { email?: string; role?: WorkspaceRole };
+    if (!body.email?.includes("@")) return c.json({ error: "valid email required" }, 400);
+    const role = body.role ?? "member";
+    if (!(role in WORKSPACE_ROLE_RANK) || role === "owner")
+      return c.json({ error: "role must be admin, member, or viewer" }, 400);
+    const { ctx } = await requireAuth(c);
+    const invite: WorkspaceInviteRow = {
+      id: newId("wsi"),
+      workspaceId: c.req.param("id"),
+      email: body.email,
+      role,
+      token: randomUUID(),
+      status: "pending",
+      invitedBy: ctx!.user.id,
+      createdAt: new Date().toISOString(),
+    };
+    await store.createWorkspaceInvite(invite);
+    const origin = new URL(c.req.url).origin;
+    return c.json({ invite, acceptUrl: `/login?invite=${invite.token}` }, 201);
+  });
+
+  /** Workspace-scoped usage rollup: runs + USD per project and totals. */
+  app.get("/v1/workspaces/:id/usage", async (c) => {
+    const denied = await requireWorkspaceRole(c, c.req.param("id"), "viewer");
+    if (denied) return denied;
+    const usage = await store.listUsageByWorkspace(c.req.param("id"));
+    const byProject = new Map<string, { runs: number; usd: number }>();
+    for (const row of usage) {
+      const agg = byProject.get(row.projectId) ?? { runs: 0, usd: 0 };
+      if (row.kind === "run") agg.runs += 1;
+      if (row.unit === "usd") agg.usd += row.amount;
+      byProject.set(row.projectId, agg);
+    }
+    const projects = [];
+    for (const [projectId, agg] of byProject) {
+      const project = await store.getProject(projectId);
+      projects.push({ projectId, name: project?.name ?? projectId, ...agg });
+    }
+    projects.sort((a, b) => b.usd - a.usd);
+    return c.json({
+      projects,
+      totals: {
+        runs: projects.reduce((s, p) => s + p.runs, 0),
+        usd: Math.round(projects.reduce((s, p) => s + p.usd, 0) * 1e4) / 1e4,
+      },
+    });
   });
 
   // ---- Role gates replacing the raw tier checks --------------------------
@@ -715,9 +887,14 @@ export function createApp(deps?: Partial<AppDeps>) {
   app.post("/v1/flows", async (c) => {
     const { ctx, error } = await requireAuth(c);
     if (!ctx) return error;
-    const project = await resolveProject(ctx);
+    const body = (await c.req.json()) as { id?: string; name?: string; objective?: string; envUrl?: string; schedule?: string | null; projectId?: string };
+    const project = await resolveProject(ctx, body.projectId);
     if (!project) return c.json({ error: "no project" }, 400);
-    const body = (await c.req.json()) as { id?: string; name?: string; objective?: string; envUrl?: string; schedule?: string | null };
+    // Writing into someone else's project (e.g. via a workspace role) needs member+.
+    if (project.userId !== ctx.user.id) {
+      const denied = await requireRole(c, project.id, "member");
+      if (denied) return denied;
+    }
     // Validate the cron expression up front so the scheduler never chokes.
     if (body.schedule) {
       try {
@@ -1039,6 +1216,25 @@ export function createApp(deps?: Partial<AppDeps>) {
     const project = await resolveProject(ctx);
     if (!project) return c.json({ pauses: [] });
     return c.json({ pauses: await store.listHumanPauses(project.id) });
+  });
+
+  // Fire a synthetic payload through a channel WITHOUT saving a rule — lets
+  // the dashboard verify delivery config (SMTP/Slack/webhook) end-to-end.
+  app.post("/v1/alerts/test", async (c) => {
+    const { ctx, error } = await requireAuth(c);
+    if (!ctx) return error;
+    const body = (await c.req.json()) as { channel?: string };
+    const channel = body.channel ?? "webhook";
+    if (!parseChannel(channel)) {
+      return c.json({ error: "channel must be email:<address>, slack:<webhook-url>, or webhook:<url>" }, 400);
+    }
+    const result = await deliver(channel, {
+      test: true,
+      message: "Veriflow test notification — if you can read this, the channel works.",
+      sentBy: ctx.user.email,
+      at: new Date().toISOString(),
+    });
+    return c.json({ result });
   });
 
   app.post("/v1/alerts/rules", async (c) => {

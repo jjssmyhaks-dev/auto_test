@@ -24,6 +24,11 @@ import {
   type UsageRow,
   type UserProgressRow,
   type UserRow,
+  type WorkspaceInviteRow,
+  type WorkspaceMemberRow,
+  type WorkspaceRole,
+  type WorkspaceRow,
+  effectiveRole,
 } from "./auth.js";
 
 export interface CloudStore {
@@ -38,6 +43,23 @@ export interface CloudStore {
   createProject(userId: string, name: string): Promise<ProjectRow>;
   listProjects(userId: string): Promise<ProjectRow[]>;
   getProject(id: string): Promise<ProjectRow | undefined>;
+  // Workspaces: a layer above projects. A workspace role acts as a FLOOR on
+  // every project inside it; per-project roles can still grant more.
+  createWorkspace(userId: string, name: string): Promise<WorkspaceRow>;
+  listWorkspaces(userId: string): Promise<WorkspaceRow[]>;
+  getWorkspace(id: string): Promise<WorkspaceRow | undefined>;
+  addWorkspaceMember(row: WorkspaceMemberRow): Promise<WorkspaceMemberRow>;
+  listWorkspaceMembers(workspaceId: string): Promise<(WorkspaceMemberRow & { email?: string })[]>;
+  removeWorkspaceMember(workspaceId: string, userId: string): Promise<boolean>;
+  setWorkspaceMemberRole(workspaceId: string, userId: string, role: WorkspaceRole): Promise<WorkspaceMemberRow | undefined>;
+  // Workspace invites: one-time tokens, accepted via /v1/invites/accept.
+  createWorkspaceInvite(row: WorkspaceInviteRow): Promise<WorkspaceInviteRow>;
+  getWorkspaceInviteByToken(token: string): Promise<WorkspaceInviteRow | undefined>;
+  acceptWorkspaceInvite(token: string, userId: string): Promise<WorkspaceInviteRow | undefined>;
+  /** Cross-project role: workspace floor combined with the project role. */
+  effectiveRoleFor(projectId: string, userId: string): Promise<ProjectRole | undefined>;
+  /** Attach (or detach with undefined) a project to a workspace. */
+  setProjectWorkspace(projectId: string, workspaceId: string | undefined): Promise<ProjectRow | undefined>;
   // Team roles: explicit membership with per-project roles. `roleFor` returns
   // the best of (project owner, member row) — existing single-user projects
   // keep working as owner without backfill.
@@ -66,6 +88,8 @@ export interface CloudStore {
   listSpans(runId: string): Promise<SpanRow[]>;
   addUsage(row: UsageRow): Promise<void>;
   listUsage(projectId: string): Promise<UsageRow[]>;
+  /** Usage across every project of a workspace (for the rollup endpoint). */
+  listUsageByWorkspace(workspaceId: string): Promise<(UsageRow & { projectId: string })[]>;
   monthlyRunCount(projectId: string, monthStartIso: string): Promise<number>;
   saveFlow(row: FlowRow): Promise<FlowRow>;
   listFlows(projectId: string): Promise<FlowRow[]>;
@@ -108,6 +132,9 @@ interface FileDb {
   projects: ProjectRow[];
   members: MemberRow[];
   invites: InviteRow[];
+  workspaces: WorkspaceRow[];
+  workspaceMembers: WorkspaceMemberRow[];
+  workspaceInvites: WorkspaceInviteRow[];
   keys: ApiKeyRow[];
   runs: RunRow[];
   steps: StepRow[];
@@ -129,6 +156,9 @@ function emptyDb(): FileDb {
     projects: [],
     members: [],
     invites: [],
+    workspaces: [],
+    workspaceMembers: [],
+    workspaceInvites: [],
     keys: [],
     runs: [],
     steps: [],
@@ -262,8 +292,106 @@ export class MemoryStore implements CloudStore {
     const member = this.db.members.find((m) => m.projectId === projectId && m.userId === userId);
     return member?.role;
   }
+  async effectiveRoleFor(projectId: string, userId: string) {
+    const projectRole = await this.roleFor(projectId, userId);
+    const project = this.db.projects.find((p) => p.id === projectId);
+    let wsRole: WorkspaceRole | undefined;
+    if (project?.workspaceId) {
+      const ws = this.db.workspaces.find((w) => w.id === project.workspaceId);
+      if (ws) {
+        if (ws.userId === userId) wsRole = "owner";
+        else wsRole = this.db.workspaceMembers.find((m) => m.workspaceId === ws.id && m.userId === userId)?.role;
+      }
+    }
+    return effectiveRole(wsRole, projectRole);
+  }
   async listMemberships(userId: string) {
     return this.db.members.filter((m) => m.userId === userId);
+  }
+  async createWorkspace(userId: string, name: string): Promise<WorkspaceRow> {
+    const ws: WorkspaceRow = {
+      id: newId("ws"),
+      userId,
+      name,
+      createdAt: new Date().toISOString(),
+    };
+    this.db.workspaces.push(ws);
+    this.touch();
+    return ws;
+  }
+  async listWorkspaces(userId: string) {
+    const memberOf = new Set(
+      this.db.workspaceMembers.filter((m) => m.userId === userId).map((m) => m.workspaceId),
+    );
+    return this.db.workspaces.filter((w) => w.userId === userId || memberOf.has(w.id));
+  }
+  async getWorkspace(id: string) {
+    return this.db.workspaces.find((w) => w.id === id);
+  }
+  async addWorkspaceMember(row: WorkspaceMemberRow) {
+    this.db.workspaceMembers = this.db.workspaceMembers.filter(
+      (m) => !(m.workspaceId === row.workspaceId && m.userId === row.userId),
+    );
+    this.db.workspaceMembers.push(row);
+    this.touch();
+    return row;
+  }
+  async listWorkspaceMembers(workspaceId: string) {
+    return this.db.workspaceMembers
+      .filter((m) => m.workspaceId === workspaceId)
+      .map((m) => ({ ...m, email: this.db.users.find((u) => u.id === m.userId)?.email }));
+  }
+  async removeWorkspaceMember(workspaceId: string, userId: string) {
+    const before = this.db.workspaceMembers.length;
+    this.db.workspaceMembers = this.db.workspaceMembers.filter(
+      (m) => !(m.workspaceId === workspaceId && m.userId === userId),
+    );
+    const removed = before > this.db.workspaceMembers.length;
+    if (removed) this.touch();
+    return removed;
+  }
+  async setWorkspaceMemberRole(workspaceId: string, userId: string, role: WorkspaceRole) {
+    const m = this.db.workspaceMembers.find(
+      (m) => m.workspaceId === workspaceId && m.userId === userId,
+    );
+    if (!m) return undefined;
+    m.role = role;
+    this.touch();
+    return m;
+  }
+  async createWorkspaceInvite(row: WorkspaceInviteRow) {
+    this.db.workspaceInvites.push(row);
+    this.touch();
+    return row;
+  }
+  async getWorkspaceInviteByToken(token: string) {
+    return this.db.workspaceInvites.find((i) => i.token === token && i.status === "pending");
+  }
+  async acceptWorkspaceInvite(token: string, userId: string) {
+    const invite = this.db.workspaceInvites.find((i) => i.token === token && i.status === "pending");
+    if (!invite) return undefined;
+    invite.status = "accepted";
+    const existing = this.db.workspaceMembers.find(
+      (m) => m.workspaceId === invite.workspaceId && m.userId === userId,
+    );
+    if (existing) existing.role = invite.role;
+    else
+      this.db.workspaceMembers.push({
+        workspaceId: invite.workspaceId,
+        userId,
+        role: invite.role,
+        addedBy: invite.invitedBy,
+        createdAt: new Date().toISOString(),
+      });
+    this.touch();
+    return invite;
+  }
+  async setProjectWorkspace(projectId: string, workspaceId: string | undefined) {
+    const p = this.db.projects.find((p) => p.id === projectId);
+    if (!p) return undefined;
+    p.workspaceId = workspaceId;
+    this.touch();
+    return p;
   }
   async createInvite(row: InviteRow) {
     this.db.invites.push(row);
@@ -349,6 +477,12 @@ export class MemoryStore implements CloudStore {
   }
   async listUsage(projectId: string) {
     return this.db.usage.filter((u) => u.projectId === projectId);
+  }
+  async listUsageByWorkspace(workspaceId: string) {
+    const projectIds = new Set(
+      this.db.projects.filter((p) => p.workspaceId === workspaceId).map((p) => p.id),
+    );
+    return this.db.usage.filter((u) => projectIds.has(u.projectId));
   }
   async monthlyRunCount(projectId: string, monthStartIso: string) {
     return this.db.usage.filter(

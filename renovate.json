@@ -1,0 +1,33 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "labels": ["dependencies"],
+  "rangeStrategy": "bump",
+  "timezone": "Asia/Kolkata",
+  "schedule": ["before 6am on monday"],
+  "packageRules": [
+    {
+      "description": "Batch all minor/patch npm updates into one weekly PR",
+      "matchManagers": ["npm"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "groupName": "all non-major dependencies"
+    },
+    {
+      "description": "Group GitHub Actions bumps",
+      "matchManagers": ["github-actions"],
+      "groupName": "github actions"
+    },
+    {
+      "description": "Next.js majors get manual review (framework-wide impact)",
+      "matchDepNames": ["next", "react", "react-dom"],
+      "matchUpdateTypes": ["major"],
+      "dependencyDashboardApproval": true
+    },
+    {
+      "description": "Playwright major bumps can break the harness; review manually",
+      "matchDepNames": ["playwright"],
+      "matchUpdateTypes": ["major"],
+      "dependencyDashboardApproval": true
+    }
+  ]
+}

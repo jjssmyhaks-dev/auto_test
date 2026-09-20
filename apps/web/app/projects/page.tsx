@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import { api } from "@/lib/api";
 import { AppPage } from "@/components/app-page";
+import { MembersStrip } from "@/components/members-strip";
 
 type Project = { id: string; name: string };
 type Key = { id: string; name: string; prefix: string; createdAt: string };
@@ -70,6 +71,14 @@ export default function ProjectsPage() {
           ))}
         </select>
       </label>
+      <section aria-label="Project members">
+        <h2>Members &amp; roles</h2>
+        <p className="text-sm text-foreground/70">
+          Who can touch this project and at what level — manage invitations and
+          role changes in Settings → Team.
+        </p>
+        {selected ? <MembersStrip projectId={selected} /> : null}
+      </section>
       <ul>
         {keys.map((k) => (
           <li key={k.id}>

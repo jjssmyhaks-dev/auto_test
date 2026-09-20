@@ -19,7 +19,10 @@ import {
 import type { ComponentProps, ReactNode } from "react";
 import { isValidElement } from "react";
 
-import { CodeBlock } from "./code-block";
+/** Lightweight code block (replaces the shiki-based one to keep deps lean). */
+const CodeBlock = ({ code }: { code: string; language?: string }) => (
+  <pre className="overflow-x-auto p-4 font-mono text-xs">{code}</pre>
+);
 
 export type ToolProps = ComponentProps<typeof Collapsible>;
 

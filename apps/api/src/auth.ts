@@ -39,7 +39,47 @@ export interface ProjectRow {
   id: string;
   userId: string;
   name: string;
+  /** Optional workspace this project belongs to. */
+  workspaceId?: string;
   createdAt: string;
+}
+
+/** Role on a workspace (cross-project). Same ladder as project roles. */
+export type WorkspaceRole = "owner" | "admin" | "member" | "viewer";
+
+export const WORKSPACE_ROLE_RANK: Record<WorkspaceRole, number> = {
+  owner: 3,
+  admin: 2,
+  member: 1,
+  viewer: 0,
+};
+
+/** A workspace groups projects; roles here apply across all its projects. */
+export interface WorkspaceRow {
+  id: string;
+  userId: string;
+  name: string;
+  createdAt: string;
+}
+
+/** A user's membership on a workspace they don't own. */
+export interface WorkspaceMemberRow {
+  workspaceId: string;
+  userId: string;
+  role: WorkspaceRole;
+  addedBy: string;
+  createdAt: string;
+}
+
+/** Cross-project role: the best of (workspace owner, workspace member row,
+ *  project membership). Workspaces grant a FLOOR on every contained project. */
+export function effectiveRole(
+  wsRole: WorkspaceRole | undefined,
+  projectRole: ProjectRole | undefined,
+): ProjectRole | undefined {
+  if (!wsRole) return projectRole;
+  if (!projectRole) return wsRole;
+  return ROLE_RANK[wsRole] >= ROLE_RANK[projectRole] ? wsRole : projectRole;
 }
 
 /** Role of a team member on a project. Owner is the creating account;
@@ -63,6 +103,18 @@ export interface InviteRow {
   projectId: string;
   email: string;
   role: ProjectRole;
+  token: string;
+  status: "pending" | "accepted" | "revoked";
+  invitedBy: string;
+  createdAt: string;
+}
+
+/** Pending invitation to a workspace (accepted via /v1/invites/accept). */
+export interface WorkspaceInviteRow {
+  id: string;
+  workspaceId: string;
+  email: string;
+  role: WorkspaceRole;
   token: string;
   status: "pending" | "accepted" | "revoked";
   invitedBy: string;

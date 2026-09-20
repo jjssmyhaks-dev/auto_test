@@ -12,6 +12,7 @@ const appLinks = [
   ["/evidence", "Evidence"],
   ["/agent-test", "Agent tests"],
   ["/projects", "Projects"],
+  ["/workspace", "Workspace"],
   ["/usage", "Usage"],
   ["/alerts", "Alerts"],
   ["/devices", "Devices"],

@@ -1009,4 +1009,127 @@ describe("Veriflow API", () => {
     });
     expect(sim.body.status).toBe("upgraded");
   });
+
+  it("workspace layer: create, invite, cross-project roles, attach, usage rollup", async () => {
+    const app = createApp({ store: new MemoryStore(), blobs: new FsBlobStore(join(tmpdir(), "vf-ws")) });
+    const signup = async (email: string) => {
+      const r = await json(app, "/v1/auth/signup", {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-forwarded-for": email },
+        body: JSON.stringify({ email, password: "password1" }),
+      });
+      return { token: r.body.token as string, id: (r.body.user as { id: string }).id };
+    };
+    const owner = await signup("ws-owner@example.com");
+    const mate = await signup("ws-mate@example.com");
+    const H = (t: string) => ({ authorization: `Bearer ${t}`, "content-type": "application/json" });
+
+    // Create a workspace and invite the teammate as a workspace admin.
+    const ws = await json(app, "/v1/workspaces", {
+      method: "POST",
+      headers: H(owner.token),
+      body: JSON.stringify({ name: "Acme QA" }),
+    });
+    expect(ws.status).toBe(201);
+    const wsId = ws.body.workspace.id as string;
+
+    const inv = await json(app, `/v1/workspaces/${wsId}/invites`, {
+      method: "POST",
+      headers: H(owner.token),
+      body: JSON.stringify({ email: "ws-mate@example.com", role: "admin" }),
+    });
+    expect(inv.status).toBe(201);
+    const accepted = await json(app, "/v1/invites/accept", {
+      method: "POST",
+      headers: H(mate.token),
+      body: JSON.stringify({ token: inv.body.invite.token as string }),
+    });
+    expect(accepted.status).toBe(200);
+
+    // Mate (workspace admin) can add members to the workspace.
+    const third = await signup("ws-third@example.com");
+    const added = await json(app, `/v1/workspaces/${wsId}/members`, {
+      method: "POST",
+      headers: H(mate.token),
+      body: JSON.stringify({ email: "ws-third@example.com", role: "viewer" }),
+    });
+    expect(added.status).toBe(201);
+    expect(third.id).toBeTruthy();
+
+    // Owner's project attaches to the workspace; mate gains access WITHOUT a
+    // per-project membership — and can even create flows in it.
+    const proj = await json(app, "/v1/projects", {
+      method: "POST",
+      headers: H(owner.token),
+      body: JSON.stringify({ name: "Owned project" }),
+    });
+    const projectId = proj.body.project.id as string;
+    const attach = await json(app, `/v1/workspaces/${wsId}/projects`, {
+      method: "POST",
+      headers: H(owner.token),
+      body: JSON.stringify({ projectId }),
+    });
+    expect(attach.status).toBe(200);
+
+    const flow = await json(app, "/v1/flows", {
+      method: "POST",
+      headers: H(mate.token),
+      body: JSON.stringify({ projectId, name: "Via workspace", objective: "check out" }),
+    });
+    expect(flow.status).toBe(200);
+
+    // A viewer can't write: add a third user as workspace viewer.
+    const peek = await signup("ws-peek@example.com");
+    const vInv = await json(app, `/v1/workspaces/${wsId}/invites`, {
+      method: "POST",
+      headers: H(owner.token),
+      body: JSON.stringify({ email: "ws-peek@example.com", role: "viewer" }),
+    });
+    await json(app, "/v1/invites/accept", {
+      method: "POST",
+      headers: H(peek.token),
+      body: JSON.stringify({ token: vInv.body.invite.token as string }),
+    });
+    const denied = await json(app, "/v1/flows", {
+      method: "POST",
+      headers: H(peek.token),
+      body: JSON.stringify({ projectId, name: "Nope", objective: "x" }),
+    });
+    expect(denied.status).toBe(403);
+
+    // Workspace-scoped usage rollup: queue a run, check it sums by project.
+    await json(app, "/v1/runs", {
+      method: "POST",
+      headers: H(owner.token),
+      body: JSON.stringify({ projectId, objective: "ws rollup run" }),
+    });
+    const usage = await json(app, `/v1/workspaces/${wsId}/usage`, { headers: H(owner.token) });
+    expect(usage.status).toBe(200);
+    const rollup = usage.body as { projects: { projectId: string; runs: number }[]; totals: { runs: number } };
+    expect(rollup.projects).toHaveLength(1);
+    expect(rollup.projects[0].projectId).toBe(projectId);
+    expect(rollup.totals.runs).toBe(1);
+
+    // Mate (workspace admin) sees the rollup too.
+    const mateUsage = await json(app, `/v1/workspaces/${wsId}/usage`, { headers: H(mate.token) });
+    expect(mateUsage.status).toBe(200);
+
+    // Non-members can't see it.
+    const stranger = await signup("ws-stranger@example.com");
+    const nope = await json(app, `/v1/workspaces/${wsId}/usage`, { headers: H(stranger.token) });
+    expect(nope.status).toBe(403);
+
+    // Owner protections: nobody demotes the workspace owner.
+    const members = await json(app, `/v1/workspaces/${wsId}/members`, { headers: H(owner.token) });
+    const ownerRow = (members.body.members as { userId: string; role: string }[]).find(
+      (m) => m.role === "owner",
+    );
+    expect(ownerRow).toBeDefined();
+    const demote = await json(app, `/v1/workspaces/${wsId}/members/${ownerRow!.userId}`, {
+      method: "PATCH",
+      headers: H(mate.token),
+      body: JSON.stringify({ role: "viewer" }),
+    });
+    expect([400, 403]).toContain(demote.status);
+  });
 });
