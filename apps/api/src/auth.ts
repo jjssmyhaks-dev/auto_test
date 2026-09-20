@@ -159,6 +159,8 @@ export interface RunRow {
   browser?: "chromium" | "firefox" | "webkit";
   /** Steps repaired by self-heal. */
   healedSteps?: number;
+  /** Details of each self-heal repair (review UI source data). */
+  heals?: Array<{ stepIndex: number; failure: string; repairedSelector?: string; originalSelector?: string }>;
 }
 
 export interface StepRow {
@@ -211,6 +213,15 @@ export interface FlowRow {
   version?: number;
   /** Network route mocks applied before navigation. */
   routes?: Array<{ pattern: string; method?: string; status?: number; body?: string; contentType?: string; headers?: Record<string, string>; abort?: boolean }>;
+  /** Self-heal repairs committed into this flow (review UI). */
+  repairs?: Array<{
+    runId: string;
+    stepIndex: number;
+    failure: string;
+    fromSelector?: string;
+    toSelector?: string;
+    committedAt: string;
+  }>;
 }
 
 /** Immutable snapshot of a flow at a point in time. */
@@ -224,6 +235,8 @@ export interface FlowVersionRow {
   envUrl?: string;
   schedule?: string;
   routes?: FlowRow["routes"];
+  /** Committed self-heal repairs at snapshot time (diffable). */
+  repairs?: FlowRow["repairs"];
   /** Hash of the definition — cheap change detection + display. */
   changeHash: string;
   /** Run id of the most recent passing run on this version, when known. */

@@ -11,6 +11,8 @@ type Flow = { id: string; name: string; objective: string; envUrl?: string; sche
 type Run = { id: string; flowId?: string; status: string; startedAt: string };
 type Flake = { flakeScore: number; runsConsidered: number; flips: number };
 type FlowVersion = { version: number; name: string; objective: string; schedule?: string; changeHash: string; lastGreenRunId?: string; createdAt: string; note?: string };
+type DiffRow = { line: string; kind: "same" | "added" | "removed" | "changed" };
+type VersionDiff = { from: { version: number; changeHash: string }; to: { version: number; changeHash: string }; changed: boolean; rows: DiffRow[] };
 type Rollup = {
   flowId: string;
   windowDays: number;
@@ -37,6 +39,8 @@ export default function FlowsPage() {
   const [flake, setFlake] = useState<Record<string, Flake>>({});
   const [versionsFor, setVersionsFor] = useState<string | null>(null);
   const [versions, setVersions] = useState<FlowVersion[]>([]);
+  const [diff, setDiff] = useState<VersionDiff | null>(null);
+  const [diffBusy, setDiffBusy] = useState(false);
   const [maxAttempts, setMaxAttempts] = useState("1");
   const [backoff, setBackoff] = useState("30");
 
@@ -68,12 +72,14 @@ export default function FlowsPage() {
   async function showVersions(flow: Flow) {
     if (versionsFor === flow.id) {
       setVersionsFor(null);
+      setDiff(null);
       return;
     }
     try {
       const r = await api<{ versions: FlowVersion[] }>(`/v1/flows/${flow.id}/versions`);
       setVersions(r.versions);
       setVersionsFor(flow.id);
+      setDiff(null);
     } catch (e) {
       setNote(e instanceof Error ? e.message : String(e));
     }
@@ -84,9 +90,24 @@ export default function FlowsPage() {
       await api(`/v1/flows/${flow.id}/rollback`, { method: "POST", body: JSON.stringify({ version }) });
       setNote(`rolled back to v${version} (saved as a new version)`);
       setVersionsFor(null);
+      setDiff(null);
       load();
     } catch (e) {
       setNote(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  /** Visual diff of a version against its predecessor. */
+  async function showDiff(flow: Flow, version: number) {
+    setDiffBusy(true);
+    setNote(null);
+    try {
+      const r = await api<VersionDiff>(`/v1/flows/${flow.id}/versions/${version - 1}/diff/${version}`);
+      setDiff(r);
+    } catch (e) {
+      setNote(e instanceof Error ? e.message : String(e));
+    } finally {
+      setDiffBusy(false);
     }
   }
 
@@ -310,6 +331,9 @@ export default function FlowsPage() {
                   </td>
                   <td>{v.note ?? ""}</td>
                   <td>
+                    <button type="button" onClick={() => showDiff(flows.find((f) => f.id === versionsFor)!, v.version)} disabled={diffBusy || v.version <= 1}>
+                      {diffBusy ? "…" : "Diff"}
+                    </button>{" "}
                     <button type="button" onClick={() => rollback(flows.find((f) => f.id === versionsFor)!, v.version)}>
                       Roll back
                     </button>
@@ -318,6 +342,29 @@ export default function FlowsPage() {
               ))}
             </tbody>
           </table>
+          {diff ? (
+            <div className="mt-3 border border-foreground/25">
+              <div className="flex items-center justify-between border-b border-foreground/25 px-3 py-2">
+                <span className="text-xs uppercase tracking-widest">
+                  Diff v{diff.from.version} → v{diff.to.version}
+                </span>
+                <span className="text-xs text-foreground/60">
+                  {diff.changed ? "changed" : "identical"} · {diff.from.changeHash.slice(0, 7)} → {diff.to.changeHash.slice(0, 7)}
+                </span>
+              </div>
+              <div className="px-3 py-2 font-mono text-xs leading-5">
+                {diff.rows.map((row, i) =>
+                  row.kind === "added" ? (
+                    <p key={i} className="bg-green-100 text-green-800 dark:bg-green-950 dark:text-green-300">+ {row.line}</p>
+                  ) : row.kind === "removed" ? (
+                    <p key={i} className="bg-red-100 text-red-800 line-through decoration-red-400/60 dark:bg-red-950 dark:text-red-300">− {row.line}</p>
+                  ) : (
+                    <p key={i} className="text-foreground/60">  {row.line}</p>
+                  ),
+                )}
+              </div>
+            </div>
+          ) : null}
         </>
       ) : null}
 

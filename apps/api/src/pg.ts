@@ -204,6 +204,9 @@ ALTER TABLE runs ADD COLUMN IF NOT EXISTS flow_version INTEGER;
 ALTER TABLE runs ADD COLUMN IF NOT EXISTS attempt INTEGER;
 ALTER TABLE runs ADD COLUMN IF NOT EXISTS browser TEXT;
 ALTER TABLE runs ADD COLUMN IF NOT EXISTS healed_steps INTEGER;
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS heals JSONB;
+ALTER TABLE flows ADD COLUMN IF NOT EXISTS repairs JSONB;
+ALTER TABLE flow_versions ADD COLUMN IF NOT EXISTS repairs JSONB;
 ALTER TABLE flows ADD COLUMN IF NOT EXISTS retry_policy JSONB;
 ALTER TABLE flows ADD COLUMN IF NOT EXISTS quarantined BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE flows ADD COLUMN IF NOT EXISTS version INTEGER NOT NULL DEFAULT 1;
@@ -702,12 +705,12 @@ export class PgStore implements CloudStore {
   }
   async upsertRun(row: RunRow) {
     await this.pool.query(
-      `INSERT INTO runs (id, project_id, flow_id, objective, env_url, status, started_at, ended_at, step_count, cost_usd, error, events, flow_version, attempt, browser, healed_steps)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+      `INSERT INTO runs (id, project_id, flow_id, objective, env_url, status, started_at, ended_at, step_count, cost_usd, error, events, flow_version, attempt, browser, healed_steps, heals)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
        ON CONFLICT (id) DO UPDATE SET
          status=EXCLUDED.status, ended_at=EXCLUDED.ended_at, step_count=EXCLUDED.step_count,
          cost_usd=EXCLUDED.cost_usd, error=EXCLUDED.error, events=EXCLUDED.events,
-         flow_version=EXCLUDED.flow_version, attempt=EXCLUDED.attempt, browser=EXCLUDED.browser, healed_steps=EXCLUDED.healed_steps`,
+         flow_version=EXCLUDED.flow_version, attempt=EXCLUDED.attempt, browser=EXCLUDED.browser, healed_steps=EXCLUDED.healed_steps, heals=EXCLUDED.heals`,
       [
         row.id,
         row.projectId,
@@ -725,6 +728,7 @@ export class PgStore implements CloudStore {
         row.attempt ?? null,
         row.browser ?? null,
         row.healedSteps ?? null,
+        row.heals ? JSON.stringify(row.heals) : null,
       ],
     );
     return row;
@@ -848,14 +852,14 @@ export class PgStore implements CloudStore {
   }
   async saveFlow(row: FlowRow) {
     await this.pool.query(
-      `INSERT INTO flows (id, project_id, name, objective, env_url, schedule, last_scheduled_at, retry_policy, quarantined, version, routes)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+      `INSERT INTO flows (id, project_id, name, objective, env_url, schedule, last_scheduled_at, retry_policy, quarantined, version, routes, repairs)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
        ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name, objective=EXCLUDED.objective, env_url=EXCLUDED.env_url,
          schedule=EXCLUDED.schedule, last_scheduled_at=EXCLUDED.last_scheduled_at, retry_policy=EXCLUDED.retry_policy,
-         quarantined=EXCLUDED.quarantined, version=EXCLUDED.version, routes=EXCLUDED.routes`,
+         quarantined=EXCLUDED.quarantined, version=EXCLUDED.version, routes=EXCLUDED.routes, repairs=EXCLUDED.repairs`,
       [row.id, row.projectId, row.name, row.objective, row.envUrl ?? null, row.schedule ?? null, row.lastScheduledAt ?? null,
         row.retryPolicy ? JSON.stringify(row.retryPolicy) : null, row.quarantined ?? false, row.version ?? 1,
-        row.routes ? JSON.stringify(row.routes) : null],
+        row.routes ? JSON.stringify(row.routes) : null, row.repairs ? JSON.stringify(row.repairs) : null],
     );
     return row;
   }
@@ -871,6 +875,7 @@ export class PgStore implements CloudStore {
       lastScheduledAt: r.last_scheduled_at ?? undefined,
       retryPolicy: r.retry_policy ?? undefined,
       quarantined: r.quarantined ?? false,
+      repairs: r.repairs ?? undefined,
       version: r.version ?? 1,
       routes: r.routes ?? undefined,
     }));
@@ -1133,17 +1138,19 @@ export class PgStore implements CloudStore {
       attempt: r.attempt ?? undefined,
       browser: r.browser ?? undefined,
       healedSteps: r.healed_steps ?? undefined,
+      heals: r.heals ?? undefined,
     };
   }
 
   // ---- Flow versioning ----
   async saveFlowVersion(row: FlowVersionRow) {
     await this.pool.query(
-      `INSERT INTO flow_versions (id, flow_id, project_id, version, name, objective, env_url, schedule, routes, change_hash, last_green_run_id, created_by, note)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+      `INSERT INTO flow_versions (id, flow_id, project_id, version, name, objective, env_url, schedule, routes, repairs, change_hash, last_green_run_id, created_by, note)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
        ON CONFLICT (flow_id, version) DO NOTHING`,
       [row.id, row.flowId, row.projectId, row.version, row.name, row.objective, row.envUrl ?? null, row.schedule ?? null,
-        row.routes ? JSON.stringify(row.routes) : null, row.changeHash, row.lastGreenRunId ?? null, row.createdBy, row.note ?? null],
+        row.routes ? JSON.stringify(row.routes) : null, row.repairs ? JSON.stringify(row.repairs) : null,
+        row.changeHash, row.lastGreenRunId ?? null, row.createdBy, row.note ?? null],
     );
     return row;
   }
@@ -1169,6 +1176,7 @@ export class PgStore implements CloudStore {
       envUrl: r.env_url ?? undefined,
       schedule: r.schedule ?? undefined,
       routes: r.routes ?? undefined,
+      repairs: r.repairs ?? undefined,
       changeHash: r.change_hash,
       lastGreenRunId: r.last_green_run_id ?? undefined,
       createdBy: r.created_by,

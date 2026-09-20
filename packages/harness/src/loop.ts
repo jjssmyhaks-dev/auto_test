@@ -39,6 +39,11 @@ export interface RunOptions {
   routes?: RouteMock[];
   /** Live-view hook: called with each step's screenshot (PNG) as the run progresses. */
   onFrame?: (frame: { stepIndex: number; png: Buffer; url: string }) => void | Promise<void>;
+  /** Called once the runId exists, before the browser launches — lets the CLI
+   * stream live frames to the dashboard for this run. */
+  onStart?: (info: { runId: string; objective: string }) => void | Promise<void>;
+  /** Called when self-heal repairs a failed step (selector + failure context). */
+  onHeal?: (heal: { runId: string; stepIndex: number; failure: string; repairedSelector?: string; originalSelector?: string }) => void;
   /** Optional live progress hook (interactive TUI-lite). Not called in agent mode. */
   progress?: (line: string) => void;
 }
@@ -53,6 +58,10 @@ export interface RunResult {
   videoPath?: string;
   /** Steps repaired by self-heal instead of failing the run. */
   healedSteps: number;
+  /** Details of each self-heal repair — feeds the review UI. */
+  heals: { stepIndex: number; failure: string; repairedSelector?: string; originalSelector?: string }[];
+  /** ISO timestamp the run started. */
+  startedAt: string;
   /** Browser engine that executed the run. */
   browser: BrowserEngine;
 }
@@ -102,6 +111,11 @@ export async function runHarness(opts: RunOptions): Promise<RunResult> {
   const otlpOn = Boolean(opts.otlp ?? config.otlpExport);
   const runId = `run_${randomUUID()}`;
   const rp = ensureRunDir(runId, home);
+  try {
+    await opts.onStart?.({ runId, objective: opts.objective });
+  } catch {
+    /* live-view plumbing must never break the run */
+  }
   const vault = new Vault(home);
   const secrets = vault.secretValues();
   const logger = new RunLogger(runId, createAgentSink(Boolean(opts.agent)), true, home);
@@ -123,6 +137,10 @@ export async function runHarness(opts: RunOptions): Promise<RunResult> {
   let healing = false;
   let healedSteps = 0;
   let lastFailure: string | undefined;
+  /** Self-heal details for the review UI: what broke and what repaired it. */
+  const heals: RunResult["heals"] = [];
+  /** The failed attempt's selector per step, so heals can show from → to. */
+  const failedSelectorByStep = new Map<number, string | undefined>();
   const progress = (line: string) => {
     if (!opts.agent) opts.progress?.(line);
   };
@@ -312,6 +330,20 @@ export async function runHarness(opts: RunOptions): Promise<RunResult> {
           if (healing) {
             logger.emit("retry", { ok: true, healed: true, detail: actDetail }, stepIndex);
             healedSteps += 1;
+            // Surface the repair: the failed selector and the one that worked,
+            // so a reviewer can commit it into the flow (review UI).
+            const healedEntry: RunResult["heals"][number] = {
+              stepIndex,
+              failure: lastFailure ?? "previous action failed",
+              repairedSelector: "target" in action ? action.target?.selector : undefined,
+              originalSelector: failedSelectorByStep.get(stepIndex),
+            };
+            heals.push(healedEntry);
+            try {
+              opts.onHeal?.({ runId, ...healedEntry });
+            } catch {
+              /* review plumbing must never break the run */
+            }
             healing = false;
             lastFailure = undefined;
           }
@@ -320,6 +352,7 @@ export async function runHarness(opts: RunOptions): Promise<RunResult> {
           actDetail = err instanceof Error ? err.message : String(err);
           actSpan.end(false, actDetail);
           logger.emit("act", { ok: false, detail: actDetail }, stepIndex);
+          failedSelectorByStep.set(stepIndex, "target" in action ? action.target?.selector : undefined);
           healCount += 1;
           if (healCount > HEAL_RETRIES) {
             status = "failed";
@@ -436,6 +469,8 @@ export async function runHarness(opts: RunOptions): Promise<RunResult> {
     reportPath: pack.reportPath,
     videoPath,
     healedSteps,
+    heals,
+    startedAt: new Date(started).toISOString(),
     browser: engine,
   };
 }

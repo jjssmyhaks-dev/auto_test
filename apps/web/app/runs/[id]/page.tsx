@@ -7,14 +7,16 @@ import { RunTraceView } from "@/components/run-trace-view";
 import Link from "next/link";
 import { TraceScrubber } from "@/components/trace-scrubber";
 import { LiveRunPane } from "@/components/live-run-pane";
+import { SelfHealReview } from "@/components/self-heal-review";
 import { AppPage } from "@/components/app-page";
 
 type Trace = {
-  run: { id: string; objective: string; status: string; error?: string };
+  run: { id: string; objective: string; status: string; error?: string; flowId?: string };
   steps: { index: number; action: unknown; status: string }[];
   spans: { kind: string; ok?: boolean; startedAt: string; error?: string; attributes?: Record<string, unknown> }[];
   screenshots: string[];
   videoUrl?: string;
+  heals?: { stepIndex: number; failure: string; repairedSelector?: string; originalSelector?: string }[];
   capture?: { network?: { url: string; method: string; status?: number }[]; console?: { type: string; text: string }[] };
 };
 
@@ -62,6 +64,11 @@ export default function RunDetailPage() {
         {trace.run.error ? ` — ${trace.run.error}` : ""}
       </p>
       <LiveRunPane runId={trace.run.id} status={trace.run.status} />
+      {trace.heals && trace.heals.length > 0 ? (
+        <div className="mt-2">
+          <SelfHealReview runId={trace.run.id} flowId={trace.run.flowId} heals={trace.heals} />
+        </div>
+      ) : null}
       <RunTraceView objective={trace.run.objective} steps={trace.steps} spans={trace.spans} />
       <h2>Scrubber</h2>
       <TraceScrubber steps={trace.steps} spans={trace.spans} screenshots={trace.screenshots} />

@@ -243,6 +243,17 @@ export const FlowSchema = z.object({
   version: z.number().int().nonnegative().optional(),
   /** Network route mocks applied before navigation. */
   routes: z.array(RouteMockSchema).optional(),
+  /** Self-heal repairs committed into this flow (review UI). */
+  repairs: z.array(
+    z.object({
+      runId: z.string(),
+      stepIndex: z.number().int().nonnegative(),
+      failure: z.string(),
+      fromSelector: z.string().optional(),
+      toSelector: z.string().optional(),
+      committedAt: z.string(),
+    }),
+  ).optional(),
 });
 export type Flow = z.infer<typeof FlowSchema>;
 

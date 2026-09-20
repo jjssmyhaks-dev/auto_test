@@ -73,6 +73,7 @@ program
   .option("--browser <engine>", "Browser engine: chromium (default), firefox, or webkit", "chromium")
   .option("--routes <file>", "JSON file of network route mocks to apply ([{pattern,status,body,abort}])")
   .option("--sync", "Push evidence to the cloud API after the run", false)
+  .option("--live", "Stream live frames to the dashboard while the run executes (auto-on when logged in)", undefined)
   .option("--pause-endpoint", "Resolve request_human pauses via a cloud magic link (CI) instead of stdin", false)
   .action(async (objective: string, opts: Record<string, unknown>) => {
     try {
@@ -91,6 +92,59 @@ program
       if (opts.routes) {
         routes = JSON.parse(readFileSync(String(opts.routes), "utf8")) as RouteMock[];
       }
+      // Live frames: with credentials, every foreground run streams its
+      // screenshots to the dashboard (auto-on; --no-live or --live=false to
+      // disable). The runId is reserved first so the run page exists before
+      // the browser launches, and frames flow while the agent works.
+      const liveExplicit = opts.live === true || opts.live === "true";
+      const liveOff = opts.live === false || opts.live === "false";
+      const cloud = CloudClient.fromEnvOrStore();
+      const liveOn = !liveOff && (liveExplicit || Boolean(cloud));
+      let live: CloudClient | undefined;
+      if (liveOn) {
+        if (!cloud) {
+          if (liveExplicit) throw new Error("--live requires credentials: run `veriflow login` or set VERIFLOW_API_KEY");
+        } else {
+          live = cloud;
+        }
+      }
+      let liveRunId: string | undefined;
+      let liveLive: CloudClient | undefined;
+      const liveHooks = live
+        ? {
+            // Reserve the run in the cloud before the browser launches so the
+            // run page (and its Live pane) exists from the first frame.
+            onStart: async ({ runId, objective: obj }: { runId: string; objective: string }) => {
+              try {
+                await live!.request("POST", "/v1/runs", {
+                  id: runId,
+                  projectId: undefined,
+                  objective: obj,
+                  status: "running",
+                  stepCount: 0,
+                });
+                liveRunId = runId;
+                liveLive = live;
+              } catch (err) {
+                console.error(`(live view unavailable: ${err instanceof Error ? err.message : err})`);
+                live = undefined;
+              }
+            },
+            // Best-effort frame push: a slow or down API must never stall the run.
+            onFrame: ({ stepIndex, png, url }: { stepIndex: number; png: Buffer; url: string }) => {
+              const client = liveLive;
+              const id = liveRunId;
+              if (!client || !id) return;
+              void client
+                .request("POST", `/v1/runs/${id}/frames`, {
+                  stepIndex,
+                  url,
+                  pngBase64: png.toString("base64"),
+                })
+                .catch(() => undefined);
+            },
+          }
+        : {};
       const result = await runHarness({
         objective,
         envUrl: opts.env as string | undefined,
@@ -106,6 +160,7 @@ program
         browser: browserOpt as BrowserEngine,
         routes,
         progress: (line) => console.error(line),
+        ...liveHooks,
         ...(cloudForPause
           ? {
               pause: async (prompt: string, ctx: { runId: string }) => {

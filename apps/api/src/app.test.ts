@@ -1190,6 +1190,84 @@ describe("Veriflow API", () => {
     expect(v3?.lastGreenRunId).toBe(run.body.id);
   });
 
+  it("self-heal review: commit repair as a version + version diff", async () => {
+    const app = createApp({ store: new MemoryStore(), blobs: new FsBlobStore(join(tmpdir(), "vf-heal")) });
+    const su = await json(app, "/v1/auth/signup", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ email: "heal@example.com", password: "password1" }),
+    });
+    const H = { authorization: `Bearer ${su.body.token as string}`, "content-type": "application/json" };
+    const flow = await json(app, "/v1/flows", {
+      method: "POST",
+      headers: H,
+      body: JSON.stringify({ name: "login", objective: "log in" }),
+    });
+    const flowId = flow.body.flow.id as string;
+
+    // A run with a healed step: failed act on step 2, healed retry with a new selector.
+    const mk = (i: number, type: string, payload: Record<string, unknown>) => ({
+      ts: new Date(Date.now() + i * 1_000).toISOString(),
+      type,
+      stepIndex: 2,
+      payload,
+    });
+    const run = await json(app, "/v1/runs", {
+      method: "POST",
+      headers: H,
+      body: JSON.stringify({
+        flowId,
+        objective: "log in",
+        status: "passed",
+        healedSteps: 1,
+        heals: [{ stepIndex: 2, failure: "selector #old-btn gone", repairedSelector: "text=Continue", originalSelector: "#old-btn" }],
+        events: [
+          mk(0, "decide", { action: { type: "click", target: { selector: "#old-btn" } } }),
+          mk(1, "act", { ok: false, detail: "selector #old-btn gone" }),
+          mk(2, "decide", { action: { type: "click", target: { selector: "text=Continue" } } }),
+          mk(3, "retry", { ok: true, healed: true, detail: "selector #old-btn gone" }),
+        ],
+      }),
+    });
+    const runId = run.body.id as string;
+
+    // Trace exposes the heal for the review UI.
+    const trace = await json(app, `/v1/runs/${runId}/trace`, { headers: H });
+    const heals = trace.body.heals as { stepIndex: number; originalSelector?: string; repairedSelector?: string }[];
+    expect(heals).toHaveLength(1);
+    expect(heals[0].originalSelector).toBe("#old-btn");
+    expect(heals[0].repairedSelector).toBe("text=Continue");
+
+    // Commit the repair → v2, recorded in the flow's repair list + audit.
+    const commit = await json(app, `/v1/flows/${flowId}/repairs`, {
+      method: "POST",
+      headers: H,
+      body: JSON.stringify({ runId, stepIndex: 2, failure: "selector #old-btn gone", fromSelector: "#old-btn", toSelector: "text=Continue" }),
+    });
+    expect(commit.status).toBe(200);
+    expect(commit.body.version).toBe(2);
+    expect(commit.body.flow.repairs).toHaveLength(1);
+    const hist = await json(app, `/v1/flows/${flowId}/versions`, { headers: H });
+    const v2 = (hist.body.versions as { version: number; note?: string }[]).find((v) => v.version === 2);
+    expect(v2?.note).toContain("self-heal");
+
+    // Diff v1 → v2 marks the changed fields.
+    const diff = await json(app, `/v1/flows/${flowId}/versions/1/diff/2`, { headers: H });
+    expect(diff.status).toBe(200);
+    expect(diff.body.changed).toBe(true);
+    const kinds = (diff.body.rows as { kind: string }[]).map((r) => r.kind);
+    expect(kinds).toContain("added");
+    expect(kinds).toContain("removed");
+
+    // Missing fields rejected.
+    const bad = await json(app, `/v1/flows/${flowId}/repairs`, {
+      method: "POST",
+      headers: H,
+      body: JSON.stringify({ runId }),
+    });
+    expect(bad.status).toBe(400);
+  });
+
   it("flake detection + quarantine + retry policy round-trip", async () => {
     const app = createApp({ store: new MemoryStore(), blobs: new FsBlobStore(join(tmpdir(), "vf-flake")) });
     const su = await json(app, "/v1/auth/signup", {

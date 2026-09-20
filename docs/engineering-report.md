@@ -108,7 +108,7 @@ No `.env` required to boot: API defaults to MemoryStore + filesystem blobs (`.ve
 | Area | Gap | Where it bites |
 | --- | --- | --- |
 | Delivery | No email/Slack for alerts or pause links; webhook is fire-and-forget, no retry | `app.ts` alert delivery, human-pauses |
-| Blobs | `S3BlobStore.deleteByPrefix` is a stub (fs store only) | demo reset on S3 deployments |
+| Blobs | `S3BlobStore.deleteByPrefix` now lists + batch-deletes via ListObjectsV2/DeleteObjects | MinIO/R2 integration run recommended |
 | Browsers | Chromium only | harness `loop.ts` |
 | Media | No run video recording | scrubber/evidence |
 | Flows | No version history; save overwrites | flows store + API |

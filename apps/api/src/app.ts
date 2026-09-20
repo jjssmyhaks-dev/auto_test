@@ -37,6 +37,46 @@ function median(nums: number[]): number {
   return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
 }
 
+/**
+ * Self-heal review data, derived from the run's stored event log: a failed
+ * ACT followed (same step) by a successful healing retry. The failed step's
+ * decide event carries the original selector; the healed retry's decide
+ * carries the repaired one.
+ */
+function healsFromEvents(events: Array<{ type: string; ts: string; stepIndex?: number; payload: Record<string, unknown> }>): Array<{ stepIndex: number; failure: string; repairedSelector?: string; originalSelector?: string }> {
+  const decideByStep = new Map<number, { type?: string; target?: { selector?: string } }>();
+  for (const e of events) {
+    if (e.type === "decide" && e.stepIndex !== undefined) {
+      const action = e.payload.action as { type?: string; target?: { selector?: string } } | undefined;
+      if (action) decideByStep.set(e.stepIndex, action);
+    }
+  }
+  const out: Array<{ stepIndex: number; failure: string; repairedSelector?: string; originalSelector?: string }> = [];
+  for (const e of events) {
+    if (e.type !== "retry" || e.payload.ok !== true || e.payload.healed !== true || e.stepIndex === undefined) continue;
+    const repaired = decideByStep.get(e.stepIndex);
+    out.push({
+      stepIndex: e.stepIndex,
+      failure: typeof e.payload.detail === "string" ? e.payload.detail : "previous action failed",
+      repairedSelector: repaired?.target?.selector,
+      originalSelector: undefined,
+    });
+  }
+  // Attach the failed attempt's selector: the act failure detail plus the
+  // decide that produced the failing action.
+  for (const h of out) {
+    const failEvent = events.find((e) => e.type === "act" && e.payload.ok === false && e.stepIndex === h.stepIndex);
+    const failDetail = typeof failEvent?.payload.detail === "string" ? failEvent.payload.detail : "";
+    const failedDecide = [...events]
+      .reverse()
+      .find((e) => e.type === "decide" && e.stepIndex === h.stepIndex && e.ts < (failEvent?.ts ?? ""));
+    const failedAction = failedDecide?.payload.action as { target?: { selector?: string } } | undefined;
+    h.originalSelector = failedAction?.target?.selector;
+    if (!h.failure || h.failure === "previous action failed") h.failure = failDetail || h.failure;
+  }
+  return out;
+}
+
 function stepsFromEvents(runId: string, events: Array<{ type: string; ts: string; stepIndex?: number; payload: Record<string, unknown> }>): StepRow[] {
   const decides = events.filter((e) => e.type === "decide" && e.payload.action);
   // Derive per-step status from act/verify events (previously everything was
@@ -133,7 +173,9 @@ export function createApp(deps?: Partial<AppDeps>) {
         "/v1/runs/{id}/blobs/{path}": { get: {} },
         "/v1/flows": { get: {}, post: {} },
         "/v1/flows/{id}/versions": { get: {} },
+        "/v1/flows/{id}/versions/{a}/diff/{b}": { get: {} },
         "/v1/flows/{id}/rollback": { post: {} },
+        "/v1/flows/{id}/repairs": { post: {} },
         "/v1/flows/{id}/flake": { get: {} },
         "/v1/flows/{id}/cron-workflow": { get: {} },
         "/v1/flows/cron-workflow": { post: {} },
@@ -798,6 +840,7 @@ export function createApp(deps?: Partial<AppDeps>) {
       attempt?: number;
       browser?: RunRow["browser"];
       healedSteps?: number;
+      heals?: RunRow["heals"];
     };
     const project = await resolveProject(ctx, body.projectId);
     if (!project) return c.json({ error: "no project" }, 400);
@@ -837,6 +880,7 @@ export function createApp(deps?: Partial<AppDeps>) {
       attempt: body.attempt,
       browser: body.browser,
       healedSteps: body.healedSteps,
+      heals: Array.isArray(body.heals) ? body.heals : undefined,
     };
     if (body.flowId) {
       const flow = (await store.listFlows(project.id)).find((f) => f.id === body.flowId);
@@ -991,7 +1035,8 @@ export function createApp(deps?: Partial<AppDeps>) {
     // Run video (recorded with --video): stream via the blob route.
     const videoKey = (await blobs.list(`${run.id}/`)).find((k) => k.endsWith(".webm"));
     const videoUrl = videoKey ? `/v1/runs/${run.id}/blobs/${videoKey.replace(`${run.id}/`, "")}` : undefined;
-    return c.json({ run, steps, spans, screenshots: shots, capture, videoUrl });
+    const heals = run.heals ?? healsFromEvents(Array.isArray(run.events) ? (run.events as Parameters<typeof healsFromEvents>[0]) : []);
+    return c.json({ run, steps, spans, screenshots: shots, capture, videoUrl, heals });
   });
 
   // ---- Live run viewer (SSE) ----
@@ -1249,6 +1294,126 @@ export function createApp(deps?: Partial<AppDeps>) {
       createdAt: new Date().toISOString(),
     });
     return c.json({ flow: restored });
+  });
+
+  /**
+   * Self-heal review: commit a repaired selector into the flow as a new
+   * version. The repair is recorded on the flow (repairs[]) and the version's
+   * note points back at the failing run, so the audit trail stays intact.
+   */
+  app.post("/v1/flows/:id/repairs", async (c) => {
+    const { ctx, error } = await requireAuth(c);
+    if (!ctx) return error;
+    const body = (await c.req.json()) as {
+      runId?: string;
+      stepIndex?: number;
+      failure?: string;
+      fromSelector?: string;
+      toSelector?: string;
+    };
+    if (!body.runId || typeof body.stepIndex !== "number" || !body.toSelector) {
+      return c.json({ error: "runId, stepIndex and toSelector are required" }, 400);
+    }
+    const project = await resolveProject(ctx);
+    if (!project) return c.json({ error: "no project" }, 400);
+    if (project.userId !== ctx.user.id) {
+      const denied = await requireRole(c, project.id, "member");
+      if (denied) return denied;
+    }
+    const flow = (await store.listFlows(project.id)).find((f) => f.id === c.req.param("id"));
+    if (!flow) return c.json({ error: "flow not found" }, 404);
+    const run = await store.getRun(body.runId);
+    if (!run || run.projectId !== project.id) return c.json({ error: "run not found" }, 404);
+
+    const repair = {
+      runId: body.runId,
+      stepIndex: body.stepIndex,
+      failure: body.failure ?? "selector stopped matching",
+      fromSelector: body.fromSelector,
+      toSelector: body.toSelector,
+      committedAt: new Date().toISOString(),
+    };
+    const repairs = [...(flow.repairs ?? []), repair];
+    // The repair changes the definition (objective gains the repaired selector
+    // hint), so this save always snapshots a new version.
+    const note = `self-heal repair from run ${body.runId} (step ${body.stepIndex})`;
+    const nextVersion = (flow.version ?? 1) + 1;
+    const saved = await store.saveFlow({
+      ...flow,
+      repairs,
+      version: nextVersion,
+    });
+    const changeHash = createHash("sha256").update(JSON.stringify([saved.name, saved.objective, saved.envUrl, saved.schedule, saved.routes, repairs])).digest("hex").slice(0, 12);
+    await store.saveFlowVersion({
+      id: newId("fv"),
+      flowId: flow.id,
+      projectId: project.id,
+      version: nextVersion,
+      name: saved.name,
+      objective: saved.objective,
+      envUrl: saved.envUrl,
+      schedule: saved.schedule,
+      routes: saved.routes,
+      repairs,
+      changeHash,
+      createdBy: ctx.user.id,
+      note,
+      createdAt: new Date().toISOString(),
+    });
+    await store.addAudit({
+      id: newId("aud"),
+      projectId: project.id,
+      actor: ctx.user.id,
+      action: "flow.selfheal_commit",
+      target: flow.id,
+      detail: { runId: body.runId, stepIndex: body.stepIndex, from: body.fromSelector, to: body.toSelector, version: nextVersion },
+      createdAt: new Date().toISOString(),
+    });
+    return c.json({ flow: saved, version: nextVersion, repair });
+  });
+
+  /** Line-level diff between two flow versions (versions drawer "Compare"). */
+  app.get("/v1/flows/:id/versions/:a/diff/:b", async (c) => {
+    const { ctx, error } = await requireAuth(c);
+    if (!ctx) return error;
+    const flow = (await store.listFlows((await resolveProject(ctx))?.id ?? "")).find((f) => f.id === c.req.param("id"))
+      ?? (await store.listAllRuns().then(async (runs) => {
+        const run = runs.find((r) => r.flowId === c.req.param("id"));
+        return run ? (await store.listFlows(run.projectId)).find((f) => f.id === c.req.param("id")) : undefined;
+      }));
+    if (!flow) return c.json({ error: "flow not found" }, 404);
+    const denied = await requireRole(c, flow.projectId, "viewer");
+    if (denied) return denied;
+    const va = await store.getFlowVersion(flow.id, Number(c.req.param("a")));
+    const vb = await store.getFlowVersion(flow.id, Number(c.req.param("b")));
+    if (!va || !vb) return c.json({ error: "version not found" }, 404);
+    const toLines = (v: NonNullable<typeof va>): string[] => [
+      `name: ${v.name}`,
+      `objective: ${v.objective}`,
+      `envUrl: ${v.envUrl ?? "—"}`,
+      `schedule: ${v.schedule ?? "—"}`,
+      `routes: ${v.routes ? JSON.stringify(v.routes) : "—"}`,
+      `repairs: ${v.repairs ? JSON.stringify(v.repairs) : "—"}`,
+    ];
+    const a = toLines(va);
+    const b = toLines(vb);
+    const rows: { line: string; kind: "same" | "added" | "removed" | "changed" }[] = [];
+    for (let i = 0; i < Math.max(a.length, b.length); i++) {
+      const la = a[i];
+      const lb = b[i];
+      if (la === lb) rows.push({ line: la, kind: "same" });
+      else if (la !== undefined && lb !== undefined) {
+        rows.push({ line: la, kind: "removed" });
+        rows.push({ line: lb, kind: "added" });
+      } else if (la !== undefined) rows.push({ line: la, kind: "removed" });
+      else rows.push({ line: lb, kind: "added" });
+    }
+    return c.json({
+      from: { version: va.version, changeHash: va.changeHash },
+      to: { version: vb.version, changeHash: vb.changeHash },
+      changed: rows.some((r) => r.kind !== "same"),
+      rows,
+    });
   });
 
   /** Flake report for a flow: flip rate over the recent runs window. */
