@@ -702,11 +702,12 @@ export class PgStore implements CloudStore {
   }
   async upsertRun(row: RunRow) {
     await this.pool.query(
-      `INSERT INTO runs (id, project_id, flow_id, objective, env_url, status, started_at, ended_at, step_count, cost_usd, error, events)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+      `INSERT INTO runs (id, project_id, flow_id, objective, env_url, status, started_at, ended_at, step_count, cost_usd, error, events, flow_version, attempt, browser, healed_steps)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
        ON CONFLICT (id) DO UPDATE SET
          status=EXCLUDED.status, ended_at=EXCLUDED.ended_at, step_count=EXCLUDED.step_count,
-         cost_usd=EXCLUDED.cost_usd, error=EXCLUDED.error, events=EXCLUDED.events`,
+         cost_usd=EXCLUDED.cost_usd, error=EXCLUDED.error, events=EXCLUDED.events,
+         flow_version=EXCLUDED.flow_version, attempt=EXCLUDED.attempt, browser=EXCLUDED.browser, healed_steps=EXCLUDED.healed_steps`,
       [
         row.id,
         row.projectId,
@@ -720,6 +721,10 @@ export class PgStore implements CloudStore {
         row.costUsd ?? null,
         row.error ?? null,
         row.events ? JSON.stringify(row.events) : null,
+        row.flowVersion ?? null,
+        row.attempt ?? null,
+        row.browser ?? null,
+        row.healedSteps ?? null,
       ],
     );
     return row;
