@@ -69,7 +69,9 @@ jobs:
         run: npx vitest run tests/golden/harness.golden.test.ts -t "01 runs a scripted"
 
       - name: PgStore smoke (schema + CRUD against the service)
-        run: node scripts/pg-smoke.mjs
+        run: |
+          pnpm --filter @veriflow/api build
+          node scripts/pg-smoke.mjs
 
       - name: Build web dashboard
         run: pnpm --filter @veriflow/web build
