@@ -279,6 +279,8 @@ export function createApp(deps?: Partial<AppDeps>) {
   const auth = async (c: { req: { header: (n: string) => string | undefined } }): Promise<AuthContext | undefined> => {
     const bearer = c.req.header("authorization")?.replace(/^Bearer\s+/i, "");
     const apiKey = c.req.header("x-api-key");
+    // EventSource can't set headers; SSE clients pass the session as ?token=.
+    const queryToken = (c.req as unknown as { query?: (n: string) => string | undefined }).query?.("token");
     if (apiKey) {
       const row = await store.findApiKey(hashToken(apiKey));
       if (!row) return undefined;
@@ -288,8 +290,9 @@ export function createApp(deps?: Partial<AppDeps>) {
       if (!user) return undefined;
       return { user, project, via: "api_key" };
     }
-    if (bearer) {
-      const session = await store.getSession(hashToken(bearer));
+    const primary = bearer ?? queryToken;
+    if (primary) {
+      const session = await store.getSession(hashToken(primary));
       if (!session) return undefined;
       const user = await store.getUser(session.userId);
       if (!user) return undefined;
@@ -864,23 +867,31 @@ export function createApp(deps?: Partial<AppDeps>) {
       await store.markVersionGreen(run.flowId, run.flowVersion, runId);
     }
     if (run.status === "passed" || run.status === "failed") {
-      const results = await fanOutWebhooks(
-        await store.listWebhooks(project.id),
-        run.status === "failed" ? "run.failed" : "run.passed",
-        { runId, flowId: run.flowId, flowVersion: run.flowVersion, objective: run.objective, status: run.status, error: run.error, attempt: run.attempt, browser: run.browser, healedSteps: run.healedSteps, projectId: project.id },
-        (id, ok, at) => store.markWebhookDelivery(id, ok, at),
-      );
-      if (results.length > 0) {
-        await store.addAudit({
-          id: newId("aud"),
-          projectId: project.id,
-          actor: "system",
-          action: run.status === "failed" ? "run.failed" : "run.passed",
-          target: runId,
-          detail: { webhooks: results.map((r) => ({ id: r.webhookId, ok: r.ok })) },
-          createdAt: new Date().toISOString(),
-        });
-      }
+      // Fire-and-(mostly)-forget: ingest must not hang on a slow receiver —
+      // deliver in the background but await a short bounded window so tests
+      // and the happy path still see deliveries recorded promptly.
+      const hookWork = (async () => {
+        const results = await fanOutWebhooks(
+          await store.listWebhooks(project.id),
+          run.status === "failed" ? "run.failed" : "run.passed",
+          { runId, flowId: run.flowId, flowVersion: run.flowVersion, objective: run.objective, status: run.status, error: run.error, attempt: run.attempt, browser: run.browser, healedSteps: run.healedSteps, projectId: project.id },
+          (id, ok, at) => store.markWebhookDelivery(id, ok, at),
+        );
+        if (results.length > 0) {
+          await store.addAudit({
+            id: newId("aud"),
+            projectId: project.id,
+            actor: "system",
+            action: run.status === "failed" ? "run.failed" : "run.passed",
+            target: runId,
+            detail: { webhooks: results.map((r) => ({ id: r.webhookId, ok: r.ok })) },
+            createdAt: new Date().toISOString(),
+          });
+        }
+      })();
+      // Bound the wait: a dead receiver costs ingest at most ~2s, not 30s.
+      await Promise.race([hookWork, new Promise((r) => setTimeout(r, 2_000))]);
+      hookWork.catch(() => {}); // background failures must not crash the process
     }
     return c.json({ id: runId, quota: { used: used + 1, limit: quota, tier: ctx.user.tier } });
   });
@@ -987,7 +998,15 @@ export function createApp(deps?: Partial<AppDeps>) {
   });
 
   /** SSE stream of live frames; replays recent frames, then streams live. */
-  app.get("/v1/runs/:id/stream", (c) => {
+  app.get("/v1/runs/:id/stream", async (c) => {
+    // AUTH: EventSource cannot set headers, so the stream accepts the session
+    // via cookie or ?token= — but it MUST authenticate (this was an open endpoint).
+    const { ctx } = await requireAuth(c);
+    if (!ctx) return c.json({ error: "unauthorized" }, 401);
+    const run = await store.getRun(c.req.param("id"));
+    if (!run) return c.json({ error: "not found" }, 404);
+    const denied = await requireRole(c, run.projectId, "viewer");
+    if (denied) return denied;
     const runId = c.req.param("id");
     c.header("content-type", "text/event-stream");
     c.header("cache-control", "no-cache");
@@ -1510,6 +1529,13 @@ export function createApp(deps?: Partial<AppDeps>) {
     const deliveryResults = [];
     for (const channel of channels) deliveryResults.push(await deliver(channel, pausePayload));
     const delivery = deliverResultSummary(deliveryResults);
+    // Outbound webhooks too: pause.created is a first-class event.
+    await fanOutWebhooks(
+      await store.listWebhooks(project.id),
+      "pause.created",
+      { pauseId: pause.id, runId: pause.runId, reason: pause.reason, magicLink: `/human-pauses/${pause.id}` },
+      (id, ok, at) => store.markWebhookDelivery(id, ok, at),
+    );
     return c.json({ pause, magicLink: `/human-pauses/${pause.id}`, delivery });
   });
 
@@ -1692,13 +1718,19 @@ export function createApp(deps?: Partial<AppDeps>) {
     }
     const days = RETENTION_DAYS[ctx.user.tier];
     const cutoff = new Date(Date.now() - days * 86_400_000).toISOString();
+    // Collect doomed run ids BEFORE the wipe so blob cleanup is per-run
+    // (a blanket `${projectId}/` prefix would be fine today but is fragile
+    // if blob keys ever gain non-run children).
+    const doomed = (await store.listRuns(project.id)).filter((r) => r.startedAt < cutoff);
     const { runs } = await store.purgeRunsBefore(project.id, cutoff);
     // Best-effort blob cleanup (fs store deletes; S3 store no-ops today).
     let blobsDeleted = 0;
-    try {
-      blobsDeleted = await blobs.deleteByPrefix(`${project.id}/`);
-    } catch {
-      /* keep the response honest about rows even if blobs lag */
+    for (const r of doomed) {
+      try {
+        blobsDeleted += await blobs.deleteByPrefix(`${r.id}/`);
+      } catch {
+        /* keep the response honest about rows even if blobs lag */
+      }
     }
     await store.addAudit({
       id: newId("aud"),

@@ -1348,8 +1348,13 @@ describe("Veriflow API", () => {
     });
     expect(pushed.status).toBe(200);
 
-    // SSE: subscribe and expect the replayed frame + hello event.
-    const res = await app.request(`/v1/runs/${runId}/stream`, { headers: { accept: "text/event-stream" } });
+    // SSE: subscribe with the token in the query string (EventSource can't set
+    // headers) and expect the hello event + replayed frame. Unauthenticated → 401.
+    const denied = await app.request(`/v1/runs/${runId}/stream`);
+    expect(denied.status).toBe(401);
+    const res = await app.request(`/v1/runs/${runId}/stream?token=${su.body.token as string}`, {
+      headers: { accept: "text/event-stream" },
+    });
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toContain("text/event-stream");
     const reader = res.body!.getReader();

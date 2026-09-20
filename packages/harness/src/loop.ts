@@ -75,13 +75,21 @@ function historyText(actions: Action[], secrets: string[]): string {
 }
 
 function resolveFill(vault: Vault, action: Action): string | undefined {
-  if (action.type !== "fill") return undefined;
-  if (action.vaultKey) {
+  if (action.type === "fill") {
+    if (action.vaultKey) {
+      const v = vault.get(action.vaultKey);
+      if (!v) throw new Error(`vault key not found: ${action.vaultKey}`);
+      return v;
+    }
+    return action.value;
+  }
+  // press with a vaultKey types the secret instead of literal action.text.
+  if (action.type === "press" && action.vaultKey) {
     const v = vault.get(action.vaultKey);
     if (!v) throw new Error(`vault key not found: ${action.vaultKey}`);
     return v;
   }
-  return action.value;
+  return undefined;
 }
 
 export async function runHarness(opts: RunOptions): Promise<RunResult> {

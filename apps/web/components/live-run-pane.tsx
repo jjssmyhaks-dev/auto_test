@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { API_URL } from "@/lib/api";
+import { API_URL, getToken } from "@/lib/api";
 
 /**
  * Live run pane: subscribes to the API's SSE frame stream and renders the
@@ -16,7 +16,10 @@ export function LiveRunPane({ runId, status }: { runId: string; status: string }
 
   useEffect(() => {
     if (status !== "running" && status !== "queued") return;
-    const es = new EventSource(`${API_URL}/v1/runs/${runId}/stream`);
+    // EventSource can't send headers; authenticate via ?token= (validated server-side).
+    const token = getToken();
+    if (!token) return;
+    const es = new EventSource(`${API_URL}/v1/runs/${runId}/stream?token=${encodeURIComponent(token)}`);
     esRef.current = es;
     es.addEventListener("hello", () => setLive(true));
     es.addEventListener("frame", (e) => {

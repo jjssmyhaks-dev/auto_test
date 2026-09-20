@@ -1,4 +1,4 @@
-import type { Page } from "playwright";
+import type { Frame, Page } from "playwright";
 import type { Action, Target } from "@veriflow/schema";
 import { compactTree, type A11yNode, type A11ySnapshot } from "./a11y.js";
 import { assertConsole, assertNetwork, assertPageState, type DevtoolsCapture } from "./devtools.js";
@@ -109,7 +109,7 @@ async function resolveFrame(page: Page, target: Target | undefined) {
   return null;
 }
 
-async function locatorFor(page: Page, target: Target | undefined, nodes: A11yNode[]) {
+async function locatorFor(page: Page | Frame, target: Target | undefined, nodes: A11yNode[]) {
   if (!target) return page.locator("body");
   if (target.ref) {
     const ref = target.ref.replace(/^@/, "");
@@ -128,6 +128,18 @@ async function locatorFor(page: Page, target: Target | undefined, nodes: A11yNod
   return page.locator("body");
 }
 
+/**
+ * Active frame for iframe-scoped actions. The `iframe` action enters a frame;
+ * subsequent click/fill/etc. resolve their locators against it until
+ * `iframe_exit` returns to the main page. Keyed by page so parallel pages
+ * (suite workers) never share state.
+ */
+const activeFrames = new WeakMap<Page, Frame>();
+
+function scopedPage(page: Page): Page | Frame {
+  return activeFrames.get(page) ?? page;
+}
+
 export async function performAction(
   page: Page,
   action: Action,
@@ -140,7 +152,7 @@ export async function performAction(
       return { ok: true, detail: `navigated ${action.url}` };
     }
     case "click": {
-      const loc = await locatorFor(page, action.target, nodes);
+      const loc = await locatorFor(scopedPage(page), action.target, nodes);
       if (loc) await loc.click({ timeout: 8_000 });
       else if (action.target.bbox) {
         const b = action.target.bbox;
@@ -151,20 +163,20 @@ export async function performAction(
       return { ok: true, detail: "clicked" };
     }
     case "fill": {
-      const loc = await locatorFor(page, action.target, nodes);
+      const loc = await locatorFor(scopedPage(page), action.target, nodes);
       const value = resolveSecret(action) ?? action.value;
       if (!loc) throw new Error("fill target not found");
       await loc.fill(value, { timeout: 8_000 });
       return { ok: true, detail: "filled" };
     }
     case "select": {
-      const loc = await locatorFor(page, action.target, nodes);
+      const loc = await locatorFor(scopedPage(page), action.target, nodes);
       if (!loc) throw new Error("select target not found");
       await loc.selectOption(action.value, { timeout: 8_000 });
       return { ok: true, detail: "selected" };
     }
     case "hover": {
-      const loc = await locatorFor(page, action.target, nodes);
+      const loc = await locatorFor(scopedPage(page), action.target, nodes);
       if (!loc) throw new Error("hover target not found");
       await loc.hover({ timeout: 8_000 });
       return { ok: true, detail: "hovered" };
@@ -182,20 +194,21 @@ export async function performAction(
       return { ok: true, detail: "waited" };
     }
     case "press": {
-      const loc = action.target ? await locatorFor(page, action.target, nodes) : undefined;
+      const loc = action.target ? await locatorFor(scopedPage(page), action.target, nodes) : undefined;
+      const secretText = action.vaultKey ? resolveSecret(action) : undefined;
       if (action.key) {
         if (loc) await loc.press(action.key, { timeout: 8_000 });
         else await page.keyboard.press(action.key);
-      } else if (action.text) {
-        if (loc) await loc.type(action.text);
-        else await page.keyboard.type(action.text);
+      } else if (secretText ?? action.text) {
+        if (loc) await loc.type((secretText ?? action.text)!);
+        else await page.keyboard.type((secretText ?? action.text)!);
       } else {
         throw new Error("press requires key or text");
       }
       return { ok: true, detail: `pressed ${action.key ?? "text"}` };
     }
     case "upload": {
-      const loc = await locatorFor(page, action.target, nodes);
+      const loc = await locatorFor(scopedPage(page), action.target, nodes);
       if (!loc) throw new Error("upload target not found");
       if (action.path) {
         await loc.setInputFiles(action.path, { timeout: 8_000 });
@@ -215,15 +228,16 @@ export async function performAction(
       return { ok: true, detail: `viewport ${action.width}x${action.height}` };
     }
     case "iframe": {
-      // Enter the frame; subsequent actions must carry selectors (refs are
-      // main-frame scoped) — resolution happens in locatorFor via the frame.
+      // Enter the frame: subsequent actions resolve against it until iframe_exit.
       const frame = await resolveFrame(page, action.target);
       if (!frame) throw new Error("iframe not found");
       await frame.waitForLoadState("domcontentloaded").catch(() => {});
-      return { ok: true, detail: "entered iframe" };
+      activeFrames.set(page, frame);
+      return { ok: true, detail: `entered iframe ${frame.url()}` };
     }
     case "iframe_exit": {
-      return { ok: true, detail: "returned to main frame" };
+      const had = activeFrames.delete(page);
+      return { ok: true, detail: had ? "returned to main frame" : "already on main frame" };
     }
     case "assert":
     case "finish":

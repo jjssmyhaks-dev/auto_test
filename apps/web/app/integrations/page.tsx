@@ -3,7 +3,6 @@
 import { useEffect, useState } from "react";
 import { api } from "@/lib/api";
 import { AppPage } from "@/components/app-page";
-import { markAction } from "@/lib/onboarding";
 
 type Webhook = { id: string; url: string; events: string[]; secretHint?: string; lastDeliveryOk?: boolean; lastDeliveryAt?: string };
 type AuditEntry = { id: string; actor: string; action: string; target?: string; detail?: Record<string, unknown>; createdAt: string };
@@ -42,7 +41,6 @@ export default function IntegrationsPage() {
       });
       setSecretOnce(r.webhook.secret);
       setUrl("");
-      markAction("create_alert_rule");
       setNote("webhook created — copy the secret now, it is shown only once");
       load();
     } catch (e) {

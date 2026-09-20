@@ -50,6 +50,14 @@ export function subscribe(runId: string, listener: Listener): () => void {
   b.listeners.add(listener);
   return () => {
     b.listeners.delete(listener);
+    // Reclaim the bus once nobody listens and frames have expired — without
+    // this, every SSE viewer leaks a Map entry for the life of the process.
+    if (b.listeners.size === 0) {
+      setTimeout(() => {
+        const current = buses.get(runId);
+        if (current && current.listeners.size === 0) buses.delete(runId);
+      }, FRAME_TTL_MS).unref?.();
+    }
   };
 }
 
