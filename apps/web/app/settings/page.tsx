@@ -31,6 +31,27 @@ export default function SettingsPage() {
   const [inviteEmail, setInviteEmail] = useState("");
   const [inviteRole, setInviteRole] = useState("member");
 
+  // Cost cap: monthly USD ceiling; the API 402s runs that exceed it.
+  const [costCap, setCostCap] = useState<string>("");
+  useEffect(() => {
+    api<{ user: { costCapUsd?: number } }>("/v1/me")
+      .then((r) => setCostCap(r.user.costCapUsd !== undefined ? String(r.user.costCapUsd) : ""))
+      .catch(() => {});
+  }, []);
+  async function saveCostCap() {
+    const parsed = costCap.trim() === "" ? null : Number(costCap);
+    if (parsed !== null && (!Number.isFinite(parsed) || parsed < 0)) {
+      setNote("cost cap must be a non-negative number");
+      return;
+    }
+    try {
+      await api("/v1/settings/cost-cap", { method: "POST", body: JSON.stringify({ costCapUsd: parsed }) });
+      setNote(parsed === null ? "cost cap cleared" : `cost cap set to $${parsed}/month`);
+    } catch (e) {
+      setNote(e instanceof Error ? e.message : String(e));
+    }
+  }
+
   const loadTeam = useCallback(() => {
     api<{ projects: { id: string }[] }>("/v1/projects")
       .then((r) => {
@@ -174,6 +195,25 @@ export default function SettingsPage() {
           </button>
         </div>
         {note ? <p className="mt-2">{note}</p> : null}
+      </section>
+      <section aria-label="Cost cap" className="mt-8">
+        <h2>Cost cap</h2>
+        <p className="text-sm text-foreground/70">
+          Monthly USD ceiling for LLM spend on this account. When a run would push spend past the
+          cap, the API refuses it with <code>cost_cap_exceeded</code> instead of charging on. Leave
+          empty for no cap.
+        </p>
+        <div className="mt-3 row">
+          <input
+            value={costCap}
+            onChange={(e) => setCostCap(e.target.value)}
+            placeholder="e.g. 25.00"
+            className="max-w-40"
+          />
+          <button type="button" onClick={saveCostCap}>
+            Save cost cap
+          </button>
+        </div>
       </section>
       <section aria-label="Demo data" className="mt-8">
         <h2>Demo data</h2>

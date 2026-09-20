@@ -1,6 +1,6 @@
 import pg from "pg";
 import type { BillingTier } from "@veriflow/schema";
-import { newId, effectiveRole, type AlertRuleRow, type ApiKeyRow, type DeviceJobRow, type DeviceRow, type FlowRow, type HumanPauseRow, type InviteRow, type MemberRow, type MetricRollupRow, type ProjectRole, type ProjectRow, type RunRow, type SpanRow, type StepRow, type UsageRow, type UserProgressRow, type UserRow, type WorkspaceInviteRow, type WorkspaceMemberRow, type WorkspaceRow } from "./auth.js";
+import { newId, effectiveRole, type AlertRuleRow, type ApiKeyRow, type AuditRow, type DeviceJobRow, type DeviceRow, type FlowRow, type FlowVersionRow, type HumanPauseRow, type InviteRow, type MemberRow, type MetricRollupRow, type ProjectRole, type ProjectRow, type RunRow, type SpanRow, type StepRow, type UsageRow, type UserProgressRow, type UserRow, type WebhookRow, type WorkspaceInviteRow, type WorkspaceMemberRow, type WorkspaceRow } from "./auth.js";
 import { SESSION_TTL_MS, type CloudStore } from "./store.js";
 
 const DDL = `
@@ -162,6 +162,52 @@ CREATE TABLE IF NOT EXISTS metric_rollups (
   human_intervention_rate DOUBLE PRECISION NOT NULL,
   guard_abort_rate DOUBLE PRECISION NOT NULL
 );
+CREATE TABLE IF NOT EXISTS flow_versions (
+  id TEXT PRIMARY KEY,
+  flow_id TEXT NOT NULL REFERENCES flows(id) ON DELETE CASCADE,
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  version INTEGER NOT NULL,
+  name TEXT NOT NULL,
+  objective TEXT NOT NULL,
+  env_url TEXT,
+  schedule TEXT,
+  routes JSONB,
+  change_hash TEXT NOT NULL,
+  last_green_run_id TEXT,
+  created_by TEXT NOT NULL,
+  note TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (flow_id, version)
+);
+CREATE TABLE IF NOT EXISTS webhooks (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  url TEXT NOT NULL,
+  secret TEXT NOT NULL,
+  events JSONB NOT NULL DEFAULT '[]',
+  disabled BOOLEAN NOT NULL DEFAULT FALSE,
+  last_delivery_at TIMESTAMPTZ,
+  last_delivery_ok BOOLEAN,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS audit_log (
+  id TEXT PRIMARY KEY,
+  project_id TEXT REFERENCES projects(id) ON DELETE CASCADE,
+  actor TEXT NOT NULL,
+  action TEXT NOT NULL,
+  target TEXT,
+  detail JSONB,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+ALTER TABLE users ADD COLUMN IF NOT EXISTS cost_cap_usd DOUBLE PRECISION;
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS flow_version INTEGER;
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS attempt INTEGER;
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS browser TEXT;
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS healed_steps INTEGER;
+ALTER TABLE flows ADD COLUMN IF NOT EXISTS retry_policy JSONB;
+ALTER TABLE flows ADD COLUMN IF NOT EXISTS quarantined BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE flows ADD COLUMN IF NOT EXISTS version INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE flows ADD COLUMN IF NOT EXISTS routes JSONB;
 CREATE TABLE IF NOT EXISTS devices (
   id TEXT PRIMARY KEY,
   project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -269,6 +315,11 @@ function mapUser(r: pg.QueryResultRow): UserRow {
 }
 
 export class PgStore implements CloudStore {
+  /** Release the pool (tests and CI smokes). */
+  async close() {
+    await this.pool.end();
+  }
+
   constructor(private readonly pool: pg.Pool) {}
 
   static async connect(url: string): Promise<PgStore> {
@@ -792,10 +843,14 @@ export class PgStore implements CloudStore {
   }
   async saveFlow(row: FlowRow) {
     await this.pool.query(
-      `INSERT INTO flows (id, project_id, name, objective, env_url, schedule, last_scheduled_at) VALUES ($1,$2,$3,$4,$5,$6,$7)
+      `INSERT INTO flows (id, project_id, name, objective, env_url, schedule, last_scheduled_at, retry_policy, quarantined, version, routes)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
        ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name, objective=EXCLUDED.objective, env_url=EXCLUDED.env_url,
-         schedule=EXCLUDED.schedule, last_scheduled_at=EXCLUDED.last_scheduled_at`,
-      [row.id, row.projectId, row.name, row.objective, row.envUrl ?? null, row.schedule ?? null, row.lastScheduledAt ?? null],
+         schedule=EXCLUDED.schedule, last_scheduled_at=EXCLUDED.last_scheduled_at, retry_policy=EXCLUDED.retry_policy,
+         quarantined=EXCLUDED.quarantined, version=EXCLUDED.version, routes=EXCLUDED.routes`,
+      [row.id, row.projectId, row.name, row.objective, row.envUrl ?? null, row.schedule ?? null, row.lastScheduledAt ?? null,
+        row.retryPolicy ? JSON.stringify(row.retryPolicy) : null, row.quarantined ?? false, row.version ?? 1,
+        row.routes ? JSON.stringify(row.routes) : null],
     );
     return row;
   }
@@ -809,6 +864,10 @@ export class PgStore implements CloudStore {
       envUrl: r.env_url ?? undefined,
       schedule: r.schedule ?? undefined,
       lastScheduledAt: r.last_scheduled_at ?? undefined,
+      retryPolicy: r.retry_policy ?? undefined,
+      quarantined: r.quarantined ?? false,
+      version: r.version ?? 1,
+      routes: r.routes ?? undefined,
     }));
   }
   async listAllRuns() {
@@ -918,9 +977,9 @@ export class PgStore implements CloudStore {
   async claimDueFlows(projectId: string, now: Date) {
     const res = await this.pool.query(
       `UPDATE flows SET last_scheduled_at = $2
-       WHERE project_id = $1 AND schedule IS NOT NULL AND schedule <> ''
+       WHERE project_id = $1 AND schedule IS NOT NULL AND schedule <> '' AND quarantined = FALSE
          AND (last_scheduled_at IS NULL OR last_scheduled_at <> $2)
-       RETURNING id, name, objective, env_url, schedule`,
+       RETURNING id, name, objective, env_url, schedule, retry_policy`,
       [projectId, now.toISOString()],
     );
     // Cron filtering happens in-process: the claim is per-minute idempotent,
@@ -940,6 +999,7 @@ export class PgStore implements CloudStore {
         objective: r.objective as string,
         envUrl: (r.env_url ?? undefined) as string | undefined,
         schedule: r.schedule as string,
+        retryPolicy: (r.retry_policy ?? undefined) as { maxAttempts: number; backoffSeconds: number } | undefined,
       }));
   }
   async saveUserProgress(row: UserProgressRow): Promise<UserProgressRow> {
@@ -1064,7 +1124,146 @@ export class PgStore implements CloudStore {
       costUsd: r.cost_usd ?? undefined,
       error: r.error ?? undefined,
       events: r.events ?? undefined,
+      flowVersion: r.flow_version ?? undefined,
+      attempt: r.attempt ?? undefined,
+      browser: r.browser ?? undefined,
+      healedSteps: r.healed_steps ?? undefined,
     };
+  }
+
+  // ---- Flow versioning ----
+  async saveFlowVersion(row: FlowVersionRow) {
+    await this.pool.query(
+      `INSERT INTO flow_versions (id, flow_id, project_id, version, name, objective, env_url, schedule, routes, change_hash, last_green_run_id, created_by, note)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+       ON CONFLICT (flow_id, version) DO NOTHING`,
+      [row.id, row.flowId, row.projectId, row.version, row.name, row.objective, row.envUrl ?? null, row.schedule ?? null,
+        row.routes ? JSON.stringify(row.routes) : null, row.changeHash, row.lastGreenRunId ?? null, row.createdBy, row.note ?? null],
+    );
+    return row;
+  }
+  async listFlowVersions(flowId: string) {
+    const res = await this.pool.query(`SELECT * FROM flow_versions WHERE flow_id=$1 ORDER BY version DESC`, [flowId]);
+    return res.rows.map((r) => this.mapFlowVersion(r));
+  }
+  async getFlowVersion(flowId: string, version: number) {
+    const res = await this.pool.query(`SELECT * FROM flow_versions WHERE flow_id=$1 AND version=$2`, [flowId, version]);
+    return res.rows[0] ? this.mapFlowVersion(res.rows[0]) : undefined;
+  }
+  async markVersionGreen(flowId: string, version: number, runId: string) {
+    await this.pool.query(`UPDATE flow_versions SET last_green_run_id=$3 WHERE flow_id=$1 AND version=$2`, [flowId, version, runId]);
+  }
+  private mapFlowVersion(r: pg.QueryResultRow): FlowVersionRow {
+    return {
+      id: r.id,
+      flowId: r.flow_id,
+      projectId: r.project_id,
+      version: r.version,
+      name: r.name,
+      objective: r.objective,
+      envUrl: r.env_url ?? undefined,
+      schedule: r.schedule ?? undefined,
+      routes: r.routes ?? undefined,
+      changeHash: r.change_hash,
+      lastGreenRunId: r.last_green_run_id ?? undefined,
+      createdBy: r.created_by,
+      note: r.note ?? undefined,
+      createdAt: new Date(r.created_at).toISOString(),
+    };
+  }
+
+  // ---- Outbound webhooks ----
+  async saveWebhook(row: WebhookRow) {
+    await this.pool.query(
+      `INSERT INTO webhooks (id, project_id, url, secret, events, disabled) VALUES ($1,$2,$3,$4,$5,$6)
+       ON CONFLICT (id) DO UPDATE SET url=EXCLUDED.url, events=EXCLUDED.events, disabled=EXCLUDED.disabled`,
+      [row.id, row.projectId, row.url, row.secret, JSON.stringify(row.events), row.disabled ?? false],
+    );
+    return row;
+  }
+  async listWebhooks(projectId: string) {
+    const res = await this.pool.query(`SELECT * FROM webhooks WHERE project_id=$1`, [projectId]);
+    return res.rows.map((r) => this.mapWebhook(r));
+  }
+  async deleteWebhook(projectId: string, id: string) {
+    const res = await this.pool.query(`DELETE FROM webhooks WHERE project_id=$1 AND id=$2`, [projectId, id]);
+    return (res.rowCount ?? 0) > 0;
+  }
+  async listAllWebhooks() {
+    const res = await this.pool.query(`SELECT * FROM webhooks`);
+    return res.rows.map((r) => this.mapWebhook(r));
+  }
+  async markWebhookDelivery(id: string, ok: boolean, at: string) {
+    await this.pool.query(`UPDATE webhooks SET last_delivery_at=$2, last_delivery_ok=$3 WHERE id=$1`, [id, at, ok]);
+  }
+  private mapWebhook(r: pg.QueryResultRow): WebhookRow {
+    return {
+      id: r.id,
+      projectId: r.project_id,
+      url: r.url,
+      secret: r.secret,
+      events: r.events ?? [],
+      disabled: r.disabled ?? false,
+      lastDeliveryAt: r.last_delivery_at ? new Date(r.last_delivery_at).toISOString() : undefined,
+      lastDeliveryOk: r.last_delivery_ok ?? undefined,
+      createdAt: new Date(r.created_at).toISOString(),
+    };
+  }
+
+  // ---- Audit log ----
+  async addAudit(row: AuditRow) {
+    await this.pool.query(
+      `INSERT INTO audit_log (id, project_id, actor, action, target, detail) VALUES ($1,$2,$3,$4,$5,$6)`,
+      [row.id, row.projectId ?? null, row.actor, row.action, row.target ?? null, row.detail ? JSON.stringify(row.detail) : null],
+    );
+  }
+  async listAudit(projectId: string, limit = 100) {
+    const res = await this.pool.query(`SELECT * FROM audit_log WHERE project_id=$1 ORDER BY created_at DESC LIMIT $2`, [projectId, limit]);
+    return res.rows.map((r) => ({
+      id: r.id,
+      projectId: r.project_id ?? undefined,
+      actor: r.actor,
+      action: r.action,
+      target: r.target ?? undefined,
+      detail: r.detail ?? undefined,
+      createdAt: new Date(r.created_at).toISOString(),
+    }));
+  }
+
+  // ---- Flake detection ----
+  async listRecentRunsForFlow(flowId: string, limit: number) {
+    const res = await this.pool.query(
+      `SELECT * FROM runs WHERE flow_id=$1 ORDER BY started_at DESC LIMIT $2`,
+      [flowId, limit],
+    );
+    return res.rows.map((r) => this.mapRun(r));
+  }
+
+  // ---- Retention purge ----
+  async purgeRunsBefore(projectId: string, cutoffIso: string) {
+    const ids = await this.pool.query(`SELECT id FROM runs WHERE project_id=$1 AND started_at < $2`, [projectId, cutoffIso]);
+    for (const row of ids.rows) {
+      await this.pool.query(`DELETE FROM steps WHERE run_id=$1`, [row.id]);
+      await this.pool.query(`DELETE FROM spans WHERE run_id=$1`, [row.id]);
+    }
+    const res = await this.pool.query(`DELETE FROM runs WHERE project_id=$1 AND started_at < $2`, [projectId, cutoffIso]);
+    return { runs: res.rowCount ?? 0 };
+  }
+
+  // ---- Cost cap ----
+  async monthlyCostUsd(projectId: string, monthStartIso: string) {
+    const res = await this.pool.query(
+      `SELECT COALESCE(SUM(amount),0) AS total FROM usage_ledger WHERE project_id=$1 AND unit='usd' AND created_at >= $2`,
+      [projectId, monthStartIso],
+    );
+    return Number(res.rows[0]?.total ?? 0);
+  }
+  async setUserCostCap(userId: string, costCapUsd: number | undefined) {
+    const res = await this.pool.query(
+      `UPDATE users SET cost_cap_usd=$2 WHERE id=$1 RETURNING *`,
+      [userId, costCapUsd ?? null],
+    );
+    return res.rows[0] ? mapUser(res.rows[0]) : undefined;
   }
 }
 

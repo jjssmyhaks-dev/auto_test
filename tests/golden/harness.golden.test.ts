@@ -59,6 +59,52 @@ describe("golden flows — auth & navigation (spec 1.8)", () => {
     expect(result.reportPath ? existsSync(result.reportPath) : false).toBe(true);
   }, 60_000);
 
+  it("01c runs the scripted login on firefox and webkit (cross-browser matrix)", async () => {
+    // Engines are skipped (not failed) when their browser isn't installed —
+    // CI installs chromium+firefox+webkit; a bare dev box may only have chromium.
+    // playwright is a harness dependency, so resolve it from the harness package.
+    const { createRequire } = await import("node:module");
+    const req = createRequire(join(process.cwd(), "packages/harness/package.json"));
+    let firefox: { executablePath: () => string } | undefined;
+    let webkit: { executablePath: () => string } | undefined;
+    try {
+      const pw = req("playwright") as { firefox?: { executablePath: () => string }; webkit?: { executablePath: () => string } };
+      firefox = pw.firefox;
+      webkit = pw.webkit;
+    } catch {
+      console.warn("skipping cross-browser matrix — playwright not importable from tests");
+      return;
+    }
+    const engines: Array<["firefox" | "webkit", { executablePath: () => string } | undefined]> = [
+      ["firefox", firefox],
+      ["webkit", webkit],
+    ];
+    for (const [engine, launcher] of engines) {
+      let installed = true;
+      try {
+        const p = launcher.executablePath();
+        installed = Boolean(p) && existsSync(p);
+      } catch {
+        installed = false;
+      }
+      if (!installed) {
+        console.warn(`skipping ${engine} — browser not installed`);
+        continue;
+      }
+      const home = newHome();
+      const result = await runHarness({
+        objective: "log in with demo@acme.test and assert the dashboard heading",
+        envUrl: site.url,
+        headless: true,
+        home,
+        browser: engine,
+        provider: scriptedProvider([...loginSteps(), assertHeading("Dashboard"), done()]),
+      });
+      expect(result.status).toBe("passed");
+      expect(result.browser).toBe(engine);
+    }
+  }, 120_000);
+
   it("01b records a webm video when video: true", async () => {
     const home = newHome();
     const result = await runHarness({

@@ -5,6 +5,7 @@ import { usePathname } from "next/navigation";
 import type { ReactNode } from "react";
 import { VeriflowMark } from "@/components/veriflow-mark";
 import { TourButton, TourGuide } from "@/components/tour-guide";
+import { ThemeToggle } from "@/components/theme-toggle";
 
 const appLinks = [
   ["/runs", "Runs"],
@@ -15,8 +16,10 @@ const appLinks = [
   ["/workspace", "Workspace"],
   ["/usage", "Usage"],
   ["/alerts", "Alerts"],
+  ["/integrations", "Integrations"],
   ["/devices", "Devices"],
   ["/settings", "Settings"],
+  ["/docs/api", "API"],
 ] as const;
 
 export function SiteChrome({ children }: { children: ReactNode }) {
@@ -34,6 +37,7 @@ export function SiteChrome({ children }: { children: ReactNode }) {
           <span className="flex items-center gap-4">
             <TourButton />
             <TourButton interactive />
+            <ThemeToggle />
             <Link href="/login" className="font-mono text-[10px] uppercase no-underline md:hidden">
               Account
             </Link>

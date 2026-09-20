@@ -4,10 +4,10 @@ import { stdin as input, stdout as output } from "node:process";
 import { randomUUID } from "node:crypto";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { chromium, type Browser, type Page } from "playwright";
+import { chromium, firefox, webkit, type Browser, type BrowserType, type Page } from "playwright";
 import { writeEvidencePack } from "@veriflow/evidence";
 import { createProvider, type LlmProvider } from "@veriflow/llm";
-import { safeParseAction, type Action, type RunStatus, type VeriflowConfig } from "@veriflow/schema";
+import { safeParseAction, type Action, type BrowserEngine, type RouteMock, type RunStatus, type VeriflowConfig } from "@veriflow/schema";
 import { ensureHome, ensureRunDir, loadConfig, persistCapture, persistSpans, readEvents, saveFlow, veriflowHome } from "@veriflow/store";
 import { RunLogger, SpanRecorder, createAgentSink, writeOtlpFile } from "@veriflow/telemetry";
 import { Vault, redactDeep, redactSecrets } from "@veriflow/vault";
@@ -33,6 +33,12 @@ export interface RunOptions {
   sync?: boolean;
   /** Record a WebM video of the whole run (Playwright recordVideo). */
   video?: boolean;
+  /** Browser engine to drive. Default chromium. */
+  browser?: BrowserEngine;
+  /** Network route mocks applied to the context before the first navigation. */
+  routes?: RouteMock[];
+  /** Live-view hook: called with each step's screenshot (PNG) as the run progresses. */
+  onFrame?: (frame: { stepIndex: number; png: Buffer; url: string }) => void | Promise<void>;
   /** Optional live progress hook (interactive TUI-lite). Not called in agent mode. */
   progress?: (line: string) => void;
 }
@@ -45,6 +51,10 @@ export interface RunResult {
   reportPath?: string;
   /** Local path of the recorded WebM when `record` was set. */
   videoPath?: string;
+  /** Steps repaired by self-heal instead of failing the run. */
+  healedSteps: number;
+  /** Browser engine that executed the run. */
+  browser: BrowserEngine;
 }
 
 export type { ConversationHarness } from "./agent-test.js";
@@ -103,10 +113,14 @@ export async function runHarness(opts: RunOptions): Promise<RunResult> {
   const HEAL_RETRIES = 2;
   let healCount = 0;
   let healing = false;
+  let healedSteps = 0;
   let lastFailure: string | undefined;
   const progress = (line: string) => {
     if (!opts.agent) opts.progress?.(line);
   };
+
+  const engine: BrowserEngine = opts.browser ?? "chromium";
+  const launchers: Record<BrowserEngine, BrowserType> = { chromium, firefox, webkit };
 
   logger.emit("run_start", {
     objective: opts.objective,
@@ -114,6 +128,7 @@ export async function runHarness(opts: RunOptions): Promise<RunResult> {
     headless: Boolean(opts.headless),
     profile: opts.profile,
     record: opts.record !== false,
+    browser: engine,
   });
   progress(`▸ objective: ${opts.objective}`);
 
@@ -122,7 +137,7 @@ export async function runHarness(opts: RunOptions): Promise<RunResult> {
   const videoOn = opts.video === true;
 
   try {
-    browser = await chromium.launch({ headless: Boolean(opts.headless) });
+    browser = await launchers[engine].launch({ headless: Boolean(opts.headless) });
     // recordVideo saves on context close, so the context is kept and closed
     // explicitly in the finally block below.
     const context = await browser.newContext({
@@ -130,6 +145,21 @@ export async function runHarness(opts: RunOptions): Promise<RunResult> {
         ? { dir: rp.dir, size: { width: 1280, height: 720 } }
         : undefined,
     });
+    // Network route mocks: deterministic stubs before any navigation.
+    for (const r of opts.routes ?? []) {
+      await context.route(r.pattern, async (route) => {
+        if (r.abort) return route.abort();
+        if (r.status !== undefined) {
+          return route.fulfill({
+            status: r.status,
+            body: r.body ?? "",
+            contentType: r.contentType ?? "application/json",
+            headers: r.headers,
+          });
+        }
+        return route.continue();
+      });
+    }
     page = await context.newPage();
     if (captureOn) {
       capture = await attachDevtoolsCapture(page);
@@ -157,6 +187,12 @@ export async function runHarness(opts: RunOptions): Promise<RunResult> {
       nodes = observed.a11y.nodes;
       const shotPath = join(rp.screenshots, `step-${stepIndex}.png`);
       writeFileSync(shotPath, observed.screenshotPng);
+      // Live view: push this frame to the SSE ticker before continuing.
+      try {
+        await opts.onFrame?.({ stepIndex, png: observed.screenshotPng, url: observed.url });
+      } catch {
+        /* live viewer must never break the run */
+      }
       // URLs can carry filled values (GET forms) — redact vault secrets there too.
       const safeUrl = redactSecrets(observed.url, secrets);
       logger.emit(
@@ -267,6 +303,7 @@ export async function runHarness(opts: RunOptions): Promise<RunResult> {
           logger.emit("act", { ok: true, detail: actDetail }, stepIndex);
           if (healing) {
             logger.emit("retry", { ok: true, healed: true, detail: actDetail }, stepIndex);
+            healedSteps += 1;
             healing = false;
             lastFailure = undefined;
           }
@@ -390,5 +427,7 @@ export async function runHarness(opts: RunOptions): Promise<RunResult> {
     evidencePath: pack.zipPath,
     reportPath: pack.reportPath,
     videoPath,
+    healedSteps,
+    browser: engine,
   };
 }

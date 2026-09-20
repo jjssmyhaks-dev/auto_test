@@ -33,6 +33,8 @@ export interface UserRow {
   passwordHash: string;
   tier: BillingTier;
   createdAt: string;
+  /** Per-project monthly cost cap in USD; runs halt when exceeded. */
+  costCapUsd?: number;
 }
 
 export interface ProjectRow {
@@ -149,6 +151,14 @@ export interface RunRow {
   costUsd?: number;
   error?: string;
   events?: unknown;
+  /** Flow version this run executed. */
+  flowVersion?: number;
+  /** 1-based attempt number when a retry policy is active. */
+  attempt?: number;
+  /** Browser engine used. */
+  browser?: "chromium" | "firefox" | "webkit";
+  /** Steps repaired by self-heal. */
+  healedSteps?: number;
 }
 
 export interface StepRow {
@@ -193,6 +203,35 @@ export interface FlowRow {
   schedule?: string;
   /** ISO timestamp of the last scheduled (claimed) run. */
   lastScheduledAt?: string;
+  /** Retry policy for failed executions (suite + scheduled). */
+  retryPolicy?: { maxAttempts: number; backoffSeconds: number };
+  /** Quarantined flows are skipped by suites/schedules but runnable by hand. */
+  quarantined?: boolean;
+  /** Latest version number (monotonic per flow). */
+  version?: number;
+  /** Network route mocks applied before navigation. */
+  routes?: Array<{ pattern: string; method?: string; status?: number; body?: string; contentType?: string; headers?: Record<string, string>; abort?: boolean }>;
+}
+
+/** Immutable snapshot of a flow at a point in time. */
+export interface FlowVersionRow {
+  id: string;
+  flowId: string;
+  projectId: string;
+  version: number;
+  name: string;
+  objective: string;
+  envUrl?: string;
+  schedule?: string;
+  routes?: FlowRow["routes"];
+  /** Hash of the definition — cheap change detection + display. */
+  changeHash: string;
+  /** Run id of the most recent passing run on this version, when known. */
+  lastGreenRunId?: string;
+  createdBy: string;
+  createdAt: string;
+  /** Human note, e.g. "added OTP wait". */
+  note?: string;
 }
 
 export interface AlertRuleRow {
@@ -203,6 +242,32 @@ export interface AlertRuleRow {
   channel: string;
   createdAt: string;
   lastTriggeredAt?: string;
+}
+
+/** Outbound webhook endpoint (HMAC-signed delivery with retry). */
+export interface WebhookRow {
+  id: string;
+  projectId: string;
+  url: string;
+  /** Secret used to sign deliveries (shown once at creation). */
+  secret: string;
+  events: string[];
+  createdAt: string;
+  disabled?: boolean;
+  lastDeliveryAt?: string;
+  lastDeliveryOk?: boolean;
+}
+
+/** Append-only audit trail of who did what. */
+export interface AuditRow {
+  id: string;
+  projectId?: string;
+  /** Acting user id (or "system" for scheduler/purges). */
+  actor: string;
+  action: string;
+  target?: string;
+  detail?: Record<string, unknown>;
+  createdAt: string;
 }
 
 export interface HumanPauseRow {

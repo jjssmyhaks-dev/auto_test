@@ -1132,4 +1132,264 @@ describe("Veriflow API", () => {
     });
     expect([400, 403]).toContain(demote.status);
   });
+
+  it("flow versioning: snapshot, history, rollback, last-green", async () => {
+    const app = createApp({ store: new MemoryStore(), blobs: new FsBlobStore(join(tmpdir(), "vf-ver")) });
+    const su = await json(app, "/v1/auth/signup", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ email: "ver@example.com", password: "password1" }),
+    });
+    const H = { authorization: `Bearer ${su.body.token as string}`, "content-type": "application/json" };
+
+    // v1
+    const f1 = await json(app, "/v1/flows", {
+      method: "POST",
+      headers: H,
+      body: JSON.stringify({ name: "checkout", objective: "buy the thing" }),
+    });
+    expect(f1.body.flow.version).toBe(1);
+    // v2 — a real definition change
+    const f2 = await json(app, "/v1/flows", {
+      method: "POST",
+      headers: H,
+      body: JSON.stringify({ id: f1.body.flow.id, name: "checkout", objective: "buy TWO things", note: "double it" }),
+    });
+    expect(f2.body.flow.version).toBe(2);
+    // A no-op save must NOT create v3 (hash-identical).
+    const f2b = await json(app, "/v1/flows", {
+      method: "POST",
+      headers: H,
+      body: JSON.stringify({ id: f1.body.flow.id, name: "checkout", objective: "buy TWO things" }),
+    });
+    expect(f2b.body.flow.version).toBe(2);
+
+    const hist = await json(app, `/v1/flows/${f1.body.flow.id}/versions`, { headers: H });
+    expect(hist.body.versions).toHaveLength(2);
+    expect(hist.body.versions[0].version).toBe(2);
+    expect(hist.body.versions[0].note).toBe("double it");
+
+    // Rollback to v1 → creates v3 with v1's objective.
+    const rb = await json(app, `/v1/flows/${f1.body.flow.id}/rollback`, {
+      method: "POST",
+      headers: H,
+      body: JSON.stringify({ version: 1 }),
+    });
+    expect(rb.body.flow.objective).toBe("buy the thing");
+    expect(rb.body.flow.version).toBe(3);
+
+    // Last-green: a passing run stamped with the flow's version marks it green.
+    const run = await json(app, "/v1/runs", {
+      method: "POST",
+      headers: H,
+      body: JSON.stringify({ flowId: f1.body.flow.id, objective: "buy the thing", status: "passed", events: [] }),
+    });
+    expect(run.status).toBe(200);
+    const hist2 = await json(app, `/v1/flows/${f1.body.flow.id}/versions`, { headers: H });
+    const v3 = (hist2.body.versions as { version: number; lastGreenRunId?: string }[]).find((v) => v.version === 3);
+    expect(v3?.lastGreenRunId).toBe(run.body.id);
+  });
+
+  it("flake detection + quarantine + retry policy round-trip", async () => {
+    const app = createApp({ store: new MemoryStore(), blobs: new FsBlobStore(join(tmpdir(), "vf-flake")) });
+    const su = await json(app, "/v1/auth/signup", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ email: "flaky@example.com", password: "password1" }),
+    });
+    const H = { authorization: `Bearer ${su.body.token as string}`, "content-type": "application/json" };
+    const flow = await json(app, "/v1/flows", {
+      method: "POST",
+      headers: H,
+      body: JSON.stringify({ name: "wobbly", objective: "flaky flow", retryPolicy: { maxAttempts: 3, backoffSeconds: 5 } }),
+    });
+    const flowId = flow.body.flow.id as string;
+
+    // pass-fail-pass-fail → 3 flips over 4 runs → score 1.0.
+    for (const status of ["passed", "failed", "passed", "failed"]) {
+      await json(app, "/v1/runs", { method: "POST", headers: H, body: JSON.stringify({ flowId, objective: "x", status, events: [] }) });
+    }
+    const report = await json(app, `/v1/flows/${flowId}/flake`, { headers: H });
+    expect(report.body.runsConsidered).toBe(4);
+    expect(report.body.flips).toBe(3);
+    expect(report.body.flakeScore).toBe(1);
+    expect(report.body.retryPolicy).toMatchObject({ maxAttempts: 3, backoffSeconds: 5 });
+
+    // Quarantine: the claim endpoint must skip it.
+    await json(app, "/v1/flows", {
+      method: "POST",
+      headers: H,
+      body: JSON.stringify({ id: flowId, name: "wobbly", objective: "flaky flow", schedule: "* * * * *", quarantined: true }),
+    });
+    const claim = await json(app, "/v1/schedules/claim", { method: "POST", headers: H, body: JSON.stringify({ now: new Date().toISOString() }) });
+    expect((claim.body.due as unknown[]).length).toBe(0);
+  });
+
+  it("outbound webhooks: create, HMAC-signed delivery on run events, audit", async () => {
+    const { createHmac } = await import("node:crypto");
+    const received: { sig: string | null; body: string }[] = [];
+    const receiver = createServer((req, res) => {
+      let body = "";
+      req.on("data", (c) => (body += String(c)));
+      req.on("end", () => {
+        received.push({ sig: req.headers["veriflow-signature"] ?? null, body });
+        res.writeHead(200).end("ok");
+      });
+    });
+    await new Promise<void>((r) => receiver.listen(0, "127.0.0.1", r as never));
+    const port = (receiver.address() as { port: number }).port;
+
+    const app = createApp({ store: new MemoryStore(), blobs: new FsBlobStore(join(tmpdir(), "vf-wh")) });
+    const su = await json(app, "/v1/auth/signup", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ email: "hooks@example.com", password: "password1" }),
+    });
+    const H = { authorization: `Bearer ${su.body.token as string}`, "content-type": "application/json" };
+
+    const created = await json(app, "/v1/webhooks", {
+      method: "POST",
+      headers: H,
+      body: JSON.stringify({ url: `http://127.0.0.1:${port}/hook`, events: ["*"] }),
+    });
+    expect(created.status).toBe(201);
+    const secret = created.body.webhook.secret as string;
+
+    // A failed run must fire run.failed with a verifiable signature.
+    await json(app, "/v1/runs", {
+      method: "POST",
+      headers: H,
+      body: JSON.stringify({ objective: "will fail", status: "failed", error: "boom", events: [] }),
+    });
+    await new Promise((r) => setTimeout(r, 300));
+    expect(received.length).toBe(1);
+    const sigMatch = received[0].sig!.match(/t=(\d+),v1=([0-9a-f]+)/);
+    expect(sigMatch).toBeTruthy();
+    const expected = createHmac("sha256", secret).update(`${sigMatch![1]}.${received[0].body}`).digest("hex");
+    expect(sigMatch![2]).toBe(expected);
+    expect(received[0].body).toContain("run.failed");
+
+    // Audit trail captured the delivery + webhook creation.
+    const audit = await json(app, "/v1/audit", { headers: H });
+    const actions = (audit.body.entries as { action: string }[]).map((e) => e.action);
+    expect(actions).toContain("run.failed");
+    expect(actions).toContain("webhook.created");
+
+    // Secrets are never listed back.
+    const list = await json(app, "/v1/webhooks", { headers: H });
+    expect(JSON.stringify(list.body)).not.toContain(secret);
+    receiver.close();
+  });
+
+  it("retention purge deletes old runs and reports the tier window", async () => {
+    const app = createApp({ store: new MemoryStore(), blobs: new FsBlobStore(join(tmpdir(), "vf-ret")) });
+    const su = await json(app, "/v1/auth/signup", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ email: "ret@example.com", password: "password1" }),
+    });
+    const H = { authorization: `Bearer ${su.body.token as string}`, "content-type": "application/json" };
+    const old = new Date(Date.now() - 30 * 86_400_000).toISOString();
+    await json(app, "/v1/runs", { method: "POST", headers: H, body: JSON.stringify({ objective: "ancient", status: "passed", startedAt: old, events: [] }) });
+    await json(app, "/v1/runs", { method: "POST", headers: H, body: JSON.stringify({ objective: "fresh", status: "passed", events: [] }) });
+    const purge = await json(app, "/v1/retention/purge", { method: "POST", headers: H, body: JSON.stringify({}) });
+    expect(purge.body.retentionDays).toBe(7); // free tier
+    expect(purge.body.runsPurged).toBeGreaterThanOrEqual(1);
+    const runs = await json(app, "/v1/runs", { headers: H });
+    const objectives = (runs.body.runs as { objective: string }[]).map((r) => r.objective);
+    expect(objectives).not.toContain("ancient");
+    expect(objectives).toContain("fresh");
+  });
+
+  it("cost cap: setting a cap makes run ingest 402 once spend exceeds it", async () => {
+    const app = createApp({ store: new MemoryStore(), blobs: new FsBlobStore(join(tmpdir(), "vf-cap")) });
+    const su = await json(app, "/v1/auth/signup", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ email: "cap@example.com", password: "password1" }),
+    });
+    const H = { authorization: `Bearer ${su.body.token as string}`, "content-type": "application/json" };
+    await json(app, "/v1/settings/cost-cap", { method: "POST", headers: H, body: JSON.stringify({ costCapUsd: 0.001 }) });
+    // First run is within cap (incoming 0).
+    const ok = await json(app, "/v1/runs", { method: "POST", headers: H, body: JSON.stringify({ objective: "cheap", status: "passed", events: [] }) });
+    expect(ok.status).toBe(200);
+    // Second run costs more than the remaining cap → 402 cost_cap_exceeded.
+    const blocked = await json(app, "/v1/runs", {
+      method: "POST",
+      headers: H,
+      body: JSON.stringify({ objective: "pricey", status: "passed", costUsd: 1, events: [] }),
+    });
+    expect(blocked.status).toBe(402);
+    expect(blocked.body.error).toBe("cost_cap_exceeded");
+  });
+
+  it("live frames: ingest + SSE stream replay", async () => {
+    const app = createApp({ store: new MemoryStore(), blobs: new FsBlobStore(join(tmpdir(), "vf-live")) });
+    const su = await json(app, "/v1/auth/signup", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ email: "live@example.com", password: "password1" }),
+    });
+    const H = { authorization: `Bearer ${su.body.token as string}`, "content-type": "application/json" };
+    const run = await json(app, "/v1/runs", { method: "POST", headers: H, body: JSON.stringify({ objective: "live", status: "running", events: [] }) });
+    const runId = run.body.id as string;
+
+    const pushed = await json(app, `/v1/runs/${runId}/frames`, {
+      method: "POST",
+      headers: H,
+      body: JSON.stringify({ stepIndex: 0, url: "http://x.test/", pngBase64: Buffer.from("png0").toString("base64") }),
+    });
+    expect(pushed.status).toBe(200);
+
+    // SSE: subscribe and expect the replayed frame + hello event.
+    const res = await app.request(`/v1/runs/${runId}/stream`, { headers: { accept: "text/event-stream" } });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("text/event-stream");
+    const reader = res.body!.getReader();
+    let text = "";
+    const deadline = Date.now() + 2000;
+    while (Date.now() < deadline && !text.includes("cG5nMA==")) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      text += new TextDecoder().decode(chunk.value);
+    }
+    await reader.cancel().catch(() => {});
+    expect(text).toContain("event: frame");
+    expect(text).toContain("event: hello");
+    // base64("png0") must appear in the replayed frame payload.
+    expect(text).toContain("cG5nMA==");
+  });
+
+  it("csrf: cookie-authenticated writes need the x-veriflow-csrf header", async () => {
+    const app = createApp({ store: new MemoryStore(), blobs: new FsBlobStore(join(tmpdir(), "vf-csrf")) });
+    const su = await json(app, "/v1/auth/signup", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ email: "csrf@example.com", password: "password1", setCookie: true }),
+    });
+    const cookie = (su.body as { setCookie?: string }).setCookie ?? "";
+    // Grab the Set-Cookie from raw headers instead.
+    const raw = await app.request("/v1/auth/login", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ email: "csrf@example.com", password: "password1", setCookie: true }),
+    });
+    const setCookie = raw.headers.get("set-cookie") ?? "";
+    expect(setCookie).toContain("vf_session");
+    // Cookie write without the CSRF header → 403.
+    const noCsrf = await app.request("/v1/flows", {
+      method: "POST",
+      headers: { "content-type": "application/json", cookie: setCookie.split(";")[0] },
+      body: JSON.stringify({ name: "x", objective: "y" }),
+    });
+    expect(noCsrf.status).toBe(403);
+    // With the header → through.
+    const withCsrf = await json(app, "/v1/flows", {
+      method: "POST",
+      headers: { "content-type": "application/json", cookie: setCookie.split(";")[0], "x-veriflow-csrf": "1" },
+      body: JSON.stringify({ name: "x", objective: "y" }),
+    });
+    expect(withCsrf.status).toBe(200);
+    void cookie;
+  });
 });

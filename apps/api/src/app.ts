@@ -1,11 +1,11 @@
-import { randomUUID } from "node:crypto";
+import { createHash, createHmac, randomUUID } from "node:crypto";
 import { Hono, type Context } from "hono";
 import { cors } from "hono/cors";
-import { TIER_QUOTAS, type BillingTier, type Span } from "@veriflow/schema";
+import { RETENTION_DAYS, TIER_QUOTAS, type BillingTier, type Span } from "@veriflow/schema";
 import { spansToOtlp } from "@veriflow/telemetry";
 import { runAgentTest, runRedTeam, parseCron, compareSteps, verifyStripeSignature } from "@veriflow/harness";
 import { rateLimit, SESSION_TTL_MS } from "./store.js";
-import { ROLE_RANK, WORKSPACE_ROLE_RANK, type MetricRollupRow, type ProjectRole, type WorkspaceInviteRow, type WorkspaceRole } from "./auth.js";
+import { ROLE_RANK, WORKSPACE_ROLE_RANK, type AuditRow, type FlowRow, type MetricRollupRow, type ProjectRole, type WebhookRow, type WorkspaceInviteRow, type WorkspaceRole } from "./auth.js";
 import {
   hashPassword,
   hashToken,
@@ -18,6 +18,8 @@ import {
   type StepRow,
 } from "./auth.js";
 import { computeAlerts, MemoryStore, monthStartIso, QUOTAS, type CloudStore } from "./store.js";
+import { pushFrame, recentFrames, subscribe } from "./live.js";
+import { fanOutWebhooks } from "./webhooks.js";
 import { githubActionsWorkflow } from "./workflow.js";
 import type { BlobStore } from "./blobs.js";
 import { deliver, deliverResultSummary, parseChannel } from "./deliver.js";
@@ -74,6 +76,28 @@ export function createApp(deps?: Partial<AppDeps>) {
   const blobs = deps?.blobs ?? new FsBlobStore(process.env.VERIFLOW_BLOBS_DIR ?? ".veriflow-data/blobs");
   const app = new Hono();
   app.use("*", cors());
+  // Secure headers: minimal CSP + hardening on every response.
+  app.use("*", async (c, next) => {
+    await next();
+    c.header("x-content-type-options", "nosniff");
+    c.header("x-frame-options", "DENY");
+    c.header("referrer-policy", "no-referrer");
+    if (c.req.path.startsWith("/v1/")) {
+      c.header("content-security-policy", "default-src 'none'; frame-ancestors 'none'");
+    }
+  });
+  // CSRF defense for cookie-authenticated browser calls: when the session
+  // arrives via cookie (not bearer), require an explicit header an attacker
+  // can't forge cross-origin.
+  app.use("*", async (c, next) => {
+    const method = c.req.method.toUpperCase();
+    if (method !== "GET" && method !== "HEAD" && c.req.header("cookie")?.includes("vf_session")) {
+      if (!c.req.header("x-veriflow-csrf")) {
+        return c.json({ error: "csrf header required for cookie auth" }, 403);
+      }
+    }
+    await next();
+  });
 
   app.get("/health", async (c) =>
     c.json({
@@ -83,6 +107,11 @@ export function createApp(deps?: Partial<AppDeps>) {
       blobs: blobs.kind,
       postgres: Boolean(process.env.DATABASE_URL),
       s3: Boolean(process.env.S3_ENDPOINT),
+      oidc: Boolean(process.env.VERIFLOW_OIDC_ISSUER),
+      smtp: Boolean(process.env.VERIFLOW_SMTP_URL || process.env.VERIFLOW_EMAIL_ENDPOINT),
+      stripe: Boolean(process.env.STRIPE_SECRET_KEY || process.env.STRIPE_WEBHOOK_SECRET),
+      version: "0.2.0",
+      uptimeSec: Math.round(process.uptime()),
     }),
   );
 
@@ -187,6 +216,48 @@ export function createApp(deps?: Partial<AppDeps>) {
     } catch (err) {
       const status = (err as { status?: number }).status === 409 ? 409 : 400;
       return c.json({ error: err instanceof Error ? err.message : "signup failed" }, status);
+    }
+  });
+
+  // ---- OIDC SSO (enterprise): exchange an authorization code for a session ----
+  // Configured via VERIFLOW_OIDC_ISSUER / _CLIENT_ID / _CLIENT_SECRET. The web
+  // app redirects to <issuer>/auth?... and lands here with ?code=&state=.
+  app.get("/v1/auth/oidc/callback", async (c) => {
+    const issuer = process.env.VERIFLOW_OIDC_ISSUER;
+    const clientId = process.env.VERIFLOW_OIDC_CLIENT_ID;
+    const clientSecret = process.env.VERIFLOW_OIDC_CLIENT_SECRET;
+    if (!issuer || !clientId || !clientSecret) return c.json({ error: "OIDC not configured" }, 501);
+    const code = c.req.query("code");
+    if (!code) return c.json({ error: "code required" }, 400);
+    try {
+      // Discover endpoints (standard OIDC discovery document).
+      const disc = (await (await fetch(`${issuer.replace(/\/$/, "")}/.well-known/openid-configuration`)).json()) as {
+        token_endpoint: string;
+        userinfo_endpoint: string;
+      };
+      const tokenRes = (await (
+        await fetch(disc.token_endpoint, {
+          method: "POST",
+          headers: { "content-type": "application/x-www-form-urlencoded" },
+          body: new URLSearchParams({ grant_type: "authorization_code", code, client_id: clientId, client_secret: clientSecret }),
+        })
+      ).json()) as { access_token?: string; id_token?: string };
+      if (!tokenRes.access_token) return c.json({ error: "token exchange failed" }, 401);
+      const userinfo = (await (
+        await fetch(disc.userinfo_endpoint, { headers: { authorization: `Bearer ${tokenRes.access_token}` } })
+      ).json()) as { email?: string; email_verified?: boolean };
+      if (!userinfo.email) return c.json({ error: "no email in OIDC claims" }, 401);
+      // Just-in-time provisioning: find or create the account, then session.
+      let user = await store.getUserByEmail(userinfo.email);
+      if (!user) {
+        user = await store.createUser(userinfo.email, `oidc:${randomUUID()}`);
+        await store.createProject(user.id, "Default");
+      }
+      const token = await issueSession(user.id);
+      maybePurgeSessions();
+      return c.json({ token, user: { id: user.id, email: user.email, tier: user.tier } });
+    } catch (err) {
+      return c.json({ error: err instanceof Error ? err.message : "OIDC callback failed" }, 502);
     }
   });
 
@@ -703,6 +774,9 @@ export function createApp(deps?: Partial<AppDeps>) {
       events?: unknown;
       spans?: Span[];
       files?: { path: string; contentBase64: string }[];
+      attempt?: number;
+      browser?: RunRow["browser"];
+      healedSteps?: number;
     };
     const project = await resolveProject(ctx, body.projectId);
     if (!project) return c.json({ error: "no project" }, 400);
@@ -713,6 +787,17 @@ export function createApp(deps?: Partial<AppDeps>) {
         { error: "quota_exceeded", tier: ctx.user.tier, used, quota, message: "Upgrade to ingest more cloud runs" },
         402,
       );
+    }
+    // Hard cost cap: monthly USD spend for this project, when the user set one.
+    if (ctx.user.costCapUsd !== undefined && ctx.user.costCapUsd > 0) {
+      const spent = await store.monthlyCostUsd(project.id, monthStartIso());
+      const incoming = body.costUsd ?? 0;
+      if (spent + incoming > ctx.user.costCapUsd) {
+        return c.json(
+          { error: "cost_cap_exceeded", spent, capUsd: ctx.user.costCapUsd, incoming, message: "Monthly cost cap reached — raise it in Settings to continue" },
+          402,
+        );
+      }
     }
     const runId = body.id ?? newId("run");
     const run: RunRow = {
@@ -728,7 +813,14 @@ export function createApp(deps?: Partial<AppDeps>) {
       costUsd: body.costUsd,
       error: typeof body.error === "string" ? body.error : undefined,
       events: body.events,
+      attempt: body.attempt,
+      browser: body.browser,
+      healedSteps: body.healedSteps,
     };
+    if (body.flowId) {
+      const flow = (await store.listFlows(project.id)).find((f) => f.id === body.flowId);
+      run.flowVersion = flow?.version;
+    }
     await store.upsertRun(run);
     const events = Array.isArray(body.events) ? (body.events as Parameters<typeof stepsFromEvents>[1]) : [];
     await store.replaceSteps(runId, stepsFromEvents(runId, events));
@@ -766,6 +858,29 @@ export function createApp(deps?: Partial<AppDeps>) {
     }
     for (const file of body.files ?? []) {
       await blobs.put(`${runId}/${file.path}`, Buffer.from(file.contentBase64, "base64"));
+    }
+    // Last-green bookkeeping + outbound webhooks (run.passed / run.failed).
+    if (run.flowId && run.flowVersion && run.status === "passed") {
+      await store.markVersionGreen(run.flowId, run.flowVersion, runId);
+    }
+    if (run.status === "passed" || run.status === "failed") {
+      const results = await fanOutWebhooks(
+        await store.listWebhooks(project.id),
+        run.status === "failed" ? "run.failed" : "run.passed",
+        { runId, flowId: run.flowId, flowVersion: run.flowVersion, objective: run.objective, status: run.status, error: run.error, attempt: run.attempt, browser: run.browser, healedSteps: run.healedSteps, projectId: project.id },
+        (id, ok, at) => store.markWebhookDelivery(id, ok, at),
+      );
+      if (results.length > 0) {
+        await store.addAudit({
+          id: newId("aud"),
+          projectId: project.id,
+          actor: "system",
+          action: run.status === "failed" ? "run.failed" : "run.passed",
+          target: runId,
+          detail: { webhooks: results.map((r) => ({ id: r.webhookId, ok: r.ok })) },
+          createdAt: new Date().toISOString(),
+        });
+      }
     }
     return c.json({ id: runId, quota: { used: used + 1, limit: quota, tier: ctx.user.tier } });
   });
@@ -850,6 +965,79 @@ export function createApp(deps?: Partial<AppDeps>) {
     return c.json({ run, steps, spans, screenshots: shots, capture, videoUrl });
   });
 
+  // ---- Live run viewer (SSE) ----
+  // Agents executing a run (CLI/device) push step frames here; the trace
+  // page's live pane subscribes and renders them as they arrive.
+  app.post("/v1/runs/:id/frames", async (c) => {
+    const { ctx, error } = await requireAuth(c);
+    if (!ctx) return error;
+    const run = await store.getRun(c.req.param("id"));
+    if (!run) return c.json({ error: "not found" }, 404);
+    const denied = await requireRole(c, run.projectId, "member");
+    if (denied) return denied;
+    const body = (await c.req.json()) as { stepIndex?: number; url?: string; pngBase64?: string };
+    if (typeof body.stepIndex !== "number" || !body.pngBase64) return c.json({ error: "stepIndex and pngBase64 required" }, 400);
+    pushFrame(run.id, {
+      stepIndex: body.stepIndex,
+      url: body.url ?? "",
+      png: Buffer.from(body.pngBase64, "base64"),
+      at: new Date().toISOString(),
+    });
+    return c.json({ ok: true });
+  });
+
+  /** SSE stream of live frames; replays recent frames, then streams live. */
+  app.get("/v1/runs/:id/stream", (c) => {
+    const runId = c.req.param("id");
+    c.header("content-type", "text/event-stream");
+    c.header("cache-control", "no-cache");
+    c.header("connection", "keep-alive");
+    const stream = new ReadableStream({
+      start(controller) {
+        const enc = new TextEncoder();
+        const send = (event: string, data: unknown) => {
+          try {
+            controller.enqueue(enc.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
+          } catch {
+            /* client gone */
+          }
+        };
+        send("hello", { runId, at: new Date().toISOString() });
+        // Replay recent frames so a fresh subscriber sees context immediately.
+        for (const f of recentFrames(runId)) {
+          send("frame", { stepIndex: f.stepIndex, url: f.url, pngBase64: f.png.toString("base64"), at: f.at });
+        }
+        const unsub = subscribe(runId, (f) => {
+          send("frame", { stepIndex: f.stepIndex, url: f.url, pngBase64: f.png.toString("base64"), at: f.at });
+          if (f.stepIndex < 0) {
+            // stepIndex -1 is the end-of-run sentinel.
+            try {
+              controller.close();
+            } catch {
+              /* already closed */
+            }
+          }
+        });
+        // Heartbeat keeps proxies from closing idle streams.
+        const beat = setInterval(() => send("ping", { at: Date.now() }), 15_000);
+        ;(c as unknown as { _vfCleanup?: (() => void)[] })._vfCleanup = [
+          () => {
+            clearInterval(beat);
+            unsub();
+          },
+        ];
+      },
+      cancel() {
+        // covered by _vfCleanup via request abort below
+      },
+    });
+    c.req.raw.signal.addEventListener("abort", () => {
+      const clean = (c as unknown as { _vfCleanup?: (() => void)[] })._vfCleanup;
+      if (clean) for (const fn of clean) fn();
+    });
+    return c.body(stream);
+  });
+
   app.get("/v1/runs/:id/blobs/*", async (c) => {
     const { ctx, error } = await requireAuth(c);
     if (!ctx) return error;
@@ -887,7 +1075,10 @@ export function createApp(deps?: Partial<AppDeps>) {
   app.post("/v1/flows", async (c) => {
     const { ctx, error } = await requireAuth(c);
     if (!ctx) return error;
-    const body = (await c.req.json()) as { id?: string; name?: string; objective?: string; envUrl?: string; schedule?: string | null; projectId?: string };
+    const body = (await c.req.json()) as {
+      id?: string; name?: string; objective?: string; envUrl?: string; schedule?: string | null; projectId?: string;
+      retryPolicy?: { maxAttempts: number; backoffSeconds: number }; quarantined?: boolean; routes?: FlowRow["routes"]; note?: string;
+    };
     const project = await resolveProject(ctx, body.projectId);
     if (!project) return c.json({ error: "no project" }, 400);
     // Writing into someone else's project (e.g. via a workspace role) needs member+.
@@ -904,15 +1095,150 @@ export function createApp(deps?: Partial<AppDeps>) {
       }
     }
     const existing = body.id ? (await store.listFlows(project.id)).find((f) => f.id === body.id) : undefined;
-    const flow = await store.saveFlow({
-      id: body.id ?? newId("flow"),
-      projectId: project.id,
+    // Snapshot every distinct definition as an immutable version; no-op saves
+    // keep the current version (hash comparison over the definition).
+    const probeFlow = {
       name: body.name ?? "flow",
       objective: body.objective ?? "",
       envUrl: body.envUrl,
       schedule: body.schedule === null ? undefined : (body.schedule ?? existing?.schedule),
+      routes: body.routes ?? existing?.routes,
+    };
+    const changeHash = createHash("sha256").update(JSON.stringify([probeFlow.name, probeFlow.objective, probeFlow.envUrl, probeFlow.schedule, probeFlow.routes])).digest("hex").slice(0, 12);
+    const prior = existing ? await store.getFlowVersion(existing.id, existing.version ?? 1) : undefined;
+    const definitionChanged = !prior || prior.changeHash !== changeHash;
+    const nextVersion = (existing?.version ?? 0) + (definitionChanged ? 1 : 0);
+    const flow = await store.saveFlow({
+      id: body.id ?? newId("flow"),
+      projectId: project.id,
+      ...probeFlow,
+      retryPolicy: body.retryPolicy ?? existing?.retryPolicy,
+      quarantined: body.quarantined ?? existing?.quarantined,
+      version: nextVersion,
     });
+    if (definitionChanged) {
+      await store.saveFlowVersion({
+        id: newId("fv"),
+        flowId: flow.id,
+        projectId: project.id,
+        version: nextVersion,
+        name: flow.name,
+        objective: flow.objective,
+        envUrl: flow.envUrl,
+        schedule: flow.schedule,
+        routes: flow.routes,
+        changeHash,
+        createdBy: ctx.user.id,
+        note: body.note,
+        createdAt: new Date().toISOString(),
+      });
+      await store.addAudit({
+        id: newId("aud"),
+        projectId: project.id,
+        actor: ctx.user.id,
+        action: existing ? "flow.updated" : "flow.created",
+        target: flow.id,
+        detail: { version: nextVersion, name: flow.name },
+        createdAt: new Date().toISOString(),
+      });
+    }
     return c.json({ flow });
+  });
+
+  // Flow version history: newest first, with change hashes + last-green links.
+  app.get("/v1/flows/:id/versions", async (c) => {
+    const { ctx, error } = await requireAuth(c);
+    if (!ctx) return error;
+    const flow = (await store.listFlows((await resolveProject(ctx))?.id ?? "")).find((f) => f.id === c.req.param("id"))
+      ?? (await store.listAllRuns().then(async (runs) => {
+        const run = runs.find((r) => r.flowId === c.req.param("id"));
+        return run ? (await store.listFlows(run.projectId)).find((f) => f.id === c.req.param("id")) : undefined;
+      }));
+    if (!flow) return c.json({ error: "flow not found" }, 404);
+    const denied = await requireRole(c, flow.projectId, "viewer");
+    if (denied) return denied;
+    return c.json({ versions: await store.listFlowVersions(flow.id), current: flow.version ?? 1 });
+  });
+
+  /** Rollback: copy an old version's definition onto the flow as a NEW version. */
+  app.post("/v1/flows/:id/rollback", async (c) => {
+    const { ctx, error } = await requireAuth(c);
+    if (!ctx) return error;
+    const body = (await c.req.json()) as { version?: number; note?: string };
+    if (!body.version) return c.json({ error: "version required" }, 400);
+    const project = await resolveProject(ctx);
+    if (!project) return c.json({ error: "no project" }, 400);
+    if (project.userId !== ctx.user.id) {
+      const denied = await requireRole(c, project.id, "member");
+      if (denied) return denied;
+    }
+    const flow = (await store.listFlows(project.id)).find((f) => f.id === c.req.param("id"));
+    if (!flow) return c.json({ error: "flow not found" }, 404);
+    const v = await store.getFlowVersion(flow.id, body.version);
+    if (!v) return c.json({ error: "version not found" }, 404);
+    const nextVersion = (flow.version ?? 1) + 1;
+    const restored = await store.saveFlow({
+      ...flow,
+      name: v.name,
+      objective: v.objective,
+      envUrl: v.envUrl,
+      schedule: v.schedule,
+      routes: v.routes,
+      version: nextVersion,
+    });
+    const changeHash = createHash("sha256").update(JSON.stringify([restored.name, restored.objective, restored.envUrl, restored.schedule, restored.routes])).digest("hex").slice(0, 12);
+    await store.saveFlowVersion({
+      id: newId("fv"),
+      flowId: flow.id,
+      projectId: project.id,
+      version: nextVersion,
+      name: v.name,
+      objective: v.objective,
+      envUrl: v.envUrl,
+      schedule: v.schedule,
+      routes: v.routes,
+      changeHash,
+      createdBy: ctx.user.id,
+      note: body.note ?? `rollback to v${body.version}`,
+      createdAt: new Date().toISOString(),
+    });
+    await store.addAudit({
+      id: newId("aud"),
+      projectId: project.id,
+      actor: ctx.user.id,
+      action: "flow.rollback",
+      target: flow.id,
+      detail: { from: flow.version ?? 1, to: body.version, newVersion: nextVersion },
+      createdAt: new Date().toISOString(),
+    });
+    return c.json({ flow: restored });
+  });
+
+  /** Flake report for a flow: flip rate over the recent runs window. */
+  app.get("/v1/flows/:id/flake", async (c) => {
+    const { ctx, error } = await requireAuth(c);
+    if (!ctx) return error;
+    const project = await resolveProject(ctx);
+    if (!project) return c.json({ error: "no project" }, 400);
+    const denied = await requireRole(c, project.id, "viewer");
+    if (denied) return denied;
+    const flow = (await store.listFlows(project.id)).find((f) => f.id === c.req.param("id"));
+    if (!flow) return c.json({ error: "flow not found" }, 404);
+    const window = Math.min(Number(c.req.query("window") ?? 20), 100);
+    const runs = await store.listRecentRunsForFlow(flow.id, window);
+    const outcomes = runs.map((r) => (r.status === "passed" ? 1 : 0));
+    const flips = outcomes.slice(1).filter((o, i) => o !== outcomes[i]).length;
+    const flakeScore = outcomes.length >= 3 ? flips / (outcomes.length - 1) : 0;
+    return c.json({
+      flowId: flow.id,
+      quarantined: flow.quarantined ?? false,
+      retryPolicy: flow.retryPolicy,
+      runsConsidered: outcomes.length,
+      flips,
+      /** 0 = stable, 1 = flips every run. >=0.25 is quarantine-worthy. */
+      flakeScore: Math.round(flakeScore * 100) / 100,
+      recent: runs.slice(0, 10).map((r) => ({ id: r.id, status: r.status, startedAt: r.startedAt, attempt: r.attempt })),
+    });
   });
 
   // Due-claim endpoint for external schedulers (cron, GitHub Actions, K8s
@@ -1220,6 +1546,24 @@ export function createApp(deps?: Partial<AppDeps>) {
 
   // Fire a synthetic payload through a channel WITHOUT saving a rule — lets
   // the dashboard verify delivery config (SMTP/Slack/webhook) end-to-end.
+  /** Set (or clear) the monthly USD cost cap; runs 402 when exceeded. */
+  app.post("/v1/settings/cost-cap", async (c) => {
+    const { ctx, error } = await requireAuth(c);
+    if (!ctx) return error;
+    const body = (await c.req.json()) as { costCapUsd?: number | null };
+    const cap = body.costCapUsd === null || body.costCapUsd === undefined ? undefined : Math.max(0, body.costCapUsd);
+    const user = await store.setUserCostCap(ctx.user.id, cap);
+    if (!user) return c.json({ error: "not found" }, 404);
+    await store.addAudit({
+      id: newId("aud"),
+      actor: ctx.user.id,
+      action: "settings.cost_cap",
+      detail: { costCapUsd: cap ?? null },
+      createdAt: new Date().toISOString(),
+    });
+    return c.json({ user: { id: user.id, costCapUsd: user.costCapUsd } });
+  });
+
   app.post("/v1/alerts/test", async (c) => {
     const { ctx, error } = await requireAuth(c);
     if (!ctx) return error;
@@ -1235,6 +1579,136 @@ export function createApp(deps?: Partial<AppDeps>) {
       at: new Date().toISOString(),
     });
     return c.json({ result });
+  });
+
+  // ---- Outbound signed webhooks ----
+  app.get("/v1/webhooks", async (c) => {
+    const { ctx, error } = await requireAuth(c);
+    if (!ctx) return error;
+    const project = await resolveProject(ctx);
+    if (!project) return c.json({ webhooks: [] });
+    const denied = await requireRole(c, project.id, "viewer");
+    if (denied) return denied;
+    // Secrets are never listed back — rotate by delete+recreate.
+    const hooks = (await store.listWebhooks(project.id)).map(({ secret, ...rest }) => ({
+      ...rest,
+      secretHint: `${secret.slice(0, 6)}…`,
+    }));
+    return c.json({ webhooks: hooks });
+  });
+
+  app.post("/v1/webhooks", async (c) => {
+    const { ctx, error } = await requireAuth(c);
+    if (!ctx) return error;
+    const project = await resolveProject(ctx);
+    if (!project) return c.json({ error: "no project" }, 400);
+    if (project.userId !== ctx.user.id) {
+      const denied = await requireRole(c, project.id, "admin");
+      if (denied) return denied;
+    }
+    const body = (await c.req.json()) as { url?: string; events?: string[] };
+    if (!body.url?.startsWith("http")) return c.json({ error: "valid url required" }, 400);
+    const secret = `whsec_${randomUUID()}`;
+    const hook = await store.saveWebhook({
+      id: newId("wh"),
+      projectId: project.id,
+      url: body.url,
+      secret,
+      events: body.events ?? ["*"],
+      createdAt: new Date().toISOString(),
+    });
+    await store.addAudit({
+      id: newId("aud"),
+      projectId: project.id,
+      actor: ctx.user.id,
+      action: "webhook.created",
+      target: hook.id,
+      detail: { url: body.url, events: hook.events },
+      createdAt: new Date().toISOString(),
+    });
+    // Secret is shown exactly once, at creation.
+    return c.json({ webhook: { ...hook, secret }, signing: "HMAC-SHA256 over `t.<body>` as `t=<unix>,v1=<hex>` (veriflow-signature header)" }, 201);
+  });
+
+  app.delete("/v1/webhooks/:id", async (c) => {
+    const { ctx, error } = await requireAuth(c);
+    if (!ctx) return error;
+    const project = await resolveProject(ctx);
+    if (!project) return c.json({ error: "no project" }, 400);
+    if (project.userId !== ctx.user.id) {
+      const denied = await requireRole(c, project.id, "admin");
+      if (denied) return denied;
+    }
+    const ok = await store.deleteWebhook(project.id, c.req.param("id"));
+    if (ok) {
+      await store.addAudit({
+        id: newId("aud"),
+        projectId: project.id,
+        actor: ctx.user.id,
+        action: "webhook.deleted",
+        target: c.req.param("id"),
+        createdAt: new Date().toISOString(),
+      });
+    }
+    return ok ? c.json({ deleted: true }) : c.json({ error: "not found" }, 404);
+  });
+
+  /** Test-fire a signed delivery to every enabled webhook. */
+  app.post("/v1/webhooks/test", async (c) => {
+    const { ctx, error } = await requireAuth(c);
+    if (!ctx) return error;
+    const project = await resolveProject(ctx);
+    if (!project) return c.json({ error: "no project" }, 400);
+    const results = await fanOutWebhooks(
+      await store.listWebhooks(project.id),
+      "alert.triggered",
+      { test: true, message: "Veriflow webhook test", sentBy: ctx.user.email },
+      (id, ok, at) => store.markWebhookDelivery(id, ok, at),
+    );
+    return c.json({ results });
+  });
+
+  // ---- Audit log ----
+  app.get("/v1/audit", async (c) => {
+    const { ctx, error } = await requireAuth(c);
+    if (!ctx) return error;
+    const project = await resolveProject(ctx);
+    if (!project) return c.json({ entries: [] });
+    const denied = await requireRole(c, project.id, "viewer");
+    if (denied) return denied;
+    const limit = Math.min(Number(c.req.query("limit") ?? 100), 500);
+    return c.json({ entries: await store.listAudit(project.id, limit) });
+  });
+
+  // ---- Retention: purge evidence older than the tier window ----
+  app.post("/v1/retention/purge", async (c) => {
+    const { ctx, error } = await requireAuth(c);
+    if (!ctx) return error;
+    const project = await resolveProject(ctx);
+    if (!project) return c.json({ error: "no project" }, 400);
+    if (project.userId !== ctx.user.id) {
+      const denied = await requireRole(c, project.id, "admin");
+      if (denied) return denied;
+    }
+    const days = RETENTION_DAYS[ctx.user.tier];
+    const cutoff = new Date(Date.now() - days * 86_400_000).toISOString();
+    const { runs } = await store.purgeRunsBefore(project.id, cutoff);
+    // Best-effort blob cleanup (fs store deletes; S3 store no-ops today).
+    let blobsDeleted = 0;
+    try {
+      blobsDeleted = await blobs.deleteByPrefix(`${project.id}/`);
+    } catch {
+      /* keep the response honest about rows even if blobs lag */
+    }
+    await store.addAudit({
+      id: newId("aud"),
+      projectId: project.id,
+      actor: ctx.user.id,
+      action: "retention.purge",
+      detail: { days, cutoff, runs },
+      createdAt: new Date().toISOString(),
+    });
+    return c.json({ tier: ctx.user.tier, retentionDays: days, cutoff, runsPurged: runs, blobsDeleted });
   });
 
   app.post("/v1/alerts/rules", async (c) => {

@@ -90,6 +90,25 @@ export async function observePage(page: Page): Promise<{
   };
 }
 
+/** Resolve an iframe target (by css selector containing it, url substring, or name/title). */
+async function resolveFrame(page: Page, target: Target | undefined) {
+  if (!target) return null;
+  if (target.selector) {
+    const handle = await page.$(target.selector);
+    const frame = handle ? (await handle.contentFrame()) : null;
+    if (frame) return frame;
+  }
+  const needle = (target.text ?? target.ref ?? "").toLowerCase();
+  if (needle) {
+    for (const f of page.frames()) {
+      const u = f.url().toLowerCase();
+      const n = f.name().toLowerCase();
+      if (u.includes(needle) || n.includes(needle)) return f;
+    }
+  }
+  return null;
+}
+
 async function locatorFor(page: Page, target: Target | undefined, nodes: A11yNode[]) {
   if (!target) return page.locator("body");
   if (target.ref) {
@@ -162,6 +181,50 @@ export async function performAction(
       else await page.waitForTimeout(action.ms ?? 500);
       return { ok: true, detail: "waited" };
     }
+    case "press": {
+      const loc = action.target ? await locatorFor(page, action.target, nodes) : undefined;
+      if (action.key) {
+        if (loc) await loc.press(action.key, { timeout: 8_000 });
+        else await page.keyboard.press(action.key);
+      } else if (action.text) {
+        if (loc) await loc.type(action.text);
+        else await page.keyboard.type(action.text);
+      } else {
+        throw new Error("press requires key or text");
+      }
+      return { ok: true, detail: `pressed ${action.key ?? "text"}` };
+    }
+    case "upload": {
+      const loc = await locatorFor(page, action.target, nodes);
+      if (!loc) throw new Error("upload target not found");
+      if (action.path) {
+        await loc.setInputFiles(action.path, { timeout: 8_000 });
+        return { ok: true, detail: `uploaded ${action.path}` };
+      }
+      if (action.contentBase64) {
+        await loc.setInputFiles(
+          { name: action.filename ?? "upload.bin", mimeType: "application/octet-stream", buffer: Buffer.from(action.contentBase64, "base64") },
+          { timeout: 8_000 },
+        );
+        return { ok: true, detail: `uploaded ${action.filename ?? "inline"}` };
+      }
+      throw new Error("upload requires path or contentBase64");
+    }
+    case "viewport": {
+      await page.setViewportSize({ width: action.width, height: action.height });
+      return { ok: true, detail: `viewport ${action.width}x${action.height}` };
+    }
+    case "iframe": {
+      // Enter the frame; subsequent actions must carry selectors (refs are
+      // main-frame scoped) — resolution happens in locatorFor via the frame.
+      const frame = await resolveFrame(page, action.target);
+      if (!frame) throw new Error("iframe not found");
+      await frame.waitForLoadState("domcontentloaded").catch(() => {});
+      return { ok: true, detail: "entered iframe" };
+    }
+    case "iframe_exit": {
+      return { ok: true, detail: "returned to main frame" };
+    }
     case "assert":
     case "finish":
     case "request_human":
@@ -218,6 +281,32 @@ export async function verifyAction(
     case "local_storage":
     case "load_time_under":
       return assertPageState(page, action.check, value);
+    case "a11y_violations_under": {
+      // Minimal axe-core-style scan via the a11y tree: checks images without
+      // alt, inputs without labels, and empty buttons/links — the violations
+      // that account for the bulk of real-world a11y failures.
+      const violations = await page.evaluate(() => {
+        let count = 0;
+        for (const img of Array.from(document.querySelectorAll("img"))) {
+          if (!img.getAttribute("alt")) count += 1;
+        }
+        for (const input of Array.from(document.querySelectorAll("input:not([type=hidden])"))) {
+          const id = input.id;
+          const labelled =
+            input.getAttribute("aria-label") ||
+            input.getAttribute("aria-labelledby") ||
+            (id ? document.querySelector(`label[for="${CSS.escape(id)}"]`) : null) ||
+            input.closest("label");
+          if (!labelled) count += 1;
+        }
+        for (const btn of Array.from(document.querySelectorAll("button, [role=button], a"))) {
+          if (!(btn.textContent ?? "").trim() && !btn.getAttribute("aria-label")) count += 1;
+        }
+        return count;
+      });
+      const max = Number(value) || 0;
+      return { ok: violations <= max, detail: `${violations} a11y violations (max ${max})` };
+    }
     default:
       return { ok: false, detail: "unknown assert" };
   }

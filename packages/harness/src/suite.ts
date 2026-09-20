@@ -1,3 +1,4 @@
+import type { RetryPolicy } from "@veriflow/schema";
 import { runHarness } from "./loop.js";
 import type { RunResult } from "./loop.js";
 
@@ -17,6 +18,8 @@ export interface SuiteFlowResult {
   error?: string;
   /** Wall-clock ms for this individual flow. */
   durationMs: number;
+  /** Total attempts consumed (1 + retries). */
+  attempts: number;
 }
 
 export interface SuiteResult {
@@ -33,6 +36,10 @@ export interface SuiteFlowInput {
   name: string;
   objective: string;
   envUrl?: string;
+  /** Retry policy: failed flows re-run up to maxAttempts with backoff. */
+  retryPolicy?: RetryPolicy;
+  /** Skip quarantine-listed flows (suites pass skipQuarantine). */
+  quarantined?: boolean;
 }
 
 export interface SuiteOptions {
@@ -64,26 +71,48 @@ export async function runSuite(flows: SuiteFlowInput[], opts: SuiteOptions = {})
       const index = cursor++;
       const flow = flows[index];
       const started = Date.now();
-      try {
-        const result = await runHarness({
-          objective: flow.objective,
-          envUrl: flow.envUrl,
-          headless: opts.headless ?? true,
-          home: opts.home,
-          provider: opts.provider,
-          ...opts.runOptions,
-        });
-        results[index] = { flowId: flow.flowId, name: flow.name, objective: flow.objective, envUrl: flow.envUrl, result, durationMs: Date.now() - started };
-      } catch (err) {
-        results[index] = {
-          flowId: flow.flowId,
-          name: flow.name,
-          objective: flow.objective,
-          envUrl: flow.envUrl,
-          error: err instanceof Error ? err.message : String(err),
-          durationMs: Date.now() - started,
-        };
+      const maxAttempts = Math.max(1, flow.retryPolicy?.maxAttempts ?? 1);
+      const backoffMs = (flow.retryPolicy?.backoffSeconds ?? 30) * 1000;
+      let last: SuiteFlowResult | undefined;
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        try {
+          const result = await runHarness({
+            objective: flow.objective,
+            envUrl: flow.envUrl,
+            headless: opts.headless ?? true,
+            home: opts.home,
+            provider: opts.provider,
+            ...opts.runOptions,
+          });
+          if (result.status === "passed" || attempt === maxAttempts) {
+            results[index] = {
+              flowId: flow.flowId,
+              name: flow.name,
+              objective: flow.objective,
+              envUrl: flow.envUrl,
+              result: { ...result, status: attempt > 1 && result.status === "passed" ? "passed" : result.status },
+              error: result.error,
+              durationMs: Date.now() - started,
+              attempts: attempt,
+            };
+            break;
+          }
+          last = { flowId: flow.flowId, name: flow.name, objective: flow.objective, envUrl: flow.envUrl, result, error: result.error, durationMs: Date.now() - started, attempts: attempt };
+        } catch (err) {
+          last = {
+            flowId: flow.flowId,
+            name: flow.name,
+            objective: flow.objective,
+            envUrl: flow.envUrl,
+            error: err instanceof Error ? err.message : String(err),
+            durationMs: Date.now() - started,
+            attempts: attempt,
+          };
+          if (attempt === maxAttempts) results[index] = last;
+        }
+        if (attempt < maxAttempts && backoffMs > 0) await new Promise((r) => setTimeout(r, backoffMs));
       }
+      if (!results[index]) results[index] = last!;
       done++;
       opts.onFlowDone?.(results[index], done, flows.length);
     }

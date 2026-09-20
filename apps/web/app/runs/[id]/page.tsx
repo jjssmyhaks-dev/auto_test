@@ -6,6 +6,7 @@ import { api } from "@/lib/api";
 import { RunTraceView } from "@/components/run-trace-view";
 import Link from "next/link";
 import { TraceScrubber } from "@/components/trace-scrubber";
+import { LiveRunPane } from "@/components/live-run-pane";
 import { AppPage } from "@/components/app-page";
 
 type Trace = {
@@ -60,6 +61,7 @@ export default function RunDetailPage() {
         Status <strong>{trace.run.status}</strong>
         {trace.run.error ? ` — ${trace.run.error}` : ""}
       </p>
+      <LiveRunPane runId={trace.run.id} status={trace.run.status} />
       <RunTraceView objective={trace.run.objective} steps={trace.steps} spans={trace.spans} />
       <h2>Scrubber</h2>
       <TraceScrubber steps={trace.steps} spans={trace.spans} screenshots={trace.screenshots} />

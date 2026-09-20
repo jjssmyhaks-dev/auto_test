@@ -9,6 +9,23 @@ jobs:
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    services:
+      # The PgStore SQL is exercised for real in CI (schema migrations + CRUD).
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: veriflow
+          POSTGRES_PASSWORD: veriflow
+          POSTGRES_DB: veriflow_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U veriflow"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://veriflow:veriflow@127.0.0.1:5432/veriflow_test
     steps:
       - uses: actions/checkout@v5
 
@@ -24,8 +41,12 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Install Playwright Chromium (for the golden-flow suite)
-        run: pnpm playwright:install
+      - name: Install Playwright Chromium + Firefox + WebKit (golden matrix)
+        run: pnpm playwright:install chromium firefox webkit
+
+      - name: Dependency audit gate (high+)
+        run: pnpm audit --audit-level high
+        continue-on-error: true # report first; enforce once Renovate lands the backlog
 
       # Build before typecheck: packages resolve @veriflow/* types from dist
       # output, which a fresh checkout does not have yet.
@@ -37,6 +58,14 @@ jobs:
 
       - name: Unit + golden-flow tests
         run: pnpm test
+
+      - name: Cross-browser golden smoke (firefox)
+        env:
+          VF_BROWSER: firefox
+        run: npx vitest run tests/golden/harness.golden.test.ts -t "01 runs a scripted"
+
+      - name: PgStore smoke (schema + CRUD against the service)
+        run: node scripts/pg-smoke.mjs
 
       - name: Build web dashboard
         run: pnpm --filter @veriflow/web build

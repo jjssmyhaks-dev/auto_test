@@ -31,6 +31,7 @@ import {
 } from "@veriflow/store";
 import { Vault, saveCredentials } from "@veriflow/vault";
 import { spansToOtlp } from "@veriflow/telemetry";
+import type { BrowserEngine, RouteMock } from "@veriflow/schema";
 
 const program = new Command()
   .name("veriflow")
@@ -69,6 +70,8 @@ program
   .option("--devtools", "Capture CDP network/console/performance", false)
   .option("--otlp", "Write OTel-shaped JSON (otlp.json) for the run", false)
   .option("--video", "Record a WebM video of the run (saved in the run dir; synced with --sync)", false)
+  .option("--browser <engine>", "Browser engine: chromium (default), firefox, or webkit", "chromium")
+  .option("--routes <file>", "JSON file of network route mocks to apply ([{pattern,status,body,abort}])")
   .option("--sync", "Push evidence to the cloud API after the run", false)
   .option("--pause-endpoint", "Resolve request_human pauses via a cloud magic link (CI) instead of stdin", false)
   .action(async (objective: string, opts: Record<string, unknown>) => {
@@ -79,6 +82,14 @@ program
       const cloudForPause = pauseEndpoint ? CloudClient.fromEnvOrStore() : undefined;
       if (pauseEndpoint && !cloudForPause) {
         throw new Error("--pause-endpoint requires credentials: run `veriflow login` or set VERIFLOW_API_KEY");
+      }
+      const browserOpt = String(opts.browser ?? "chromium");
+      if (!("chromium firefox webkit".split(" ")).includes(browserOpt)) {
+        throw new Error(`unknown browser "${browserOpt}" — use chromium, firefox, or webkit`);
+      }
+      let routes: RouteMock[] | undefined;
+      if (opts.routes) {
+        routes = JSON.parse(readFileSync(String(opts.routes), "utf8")) as RouteMock[];
       }
       const result = await runHarness({
         objective,
@@ -92,6 +103,8 @@ program
         otlp: Boolean(opts.otlp),
         record: opts.record !== false,
         video: opts.video === true,
+        browser: browserOpt as BrowserEngine,
+        routes,
         progress: (line) => console.error(line),
         ...(cloudForPause
           ? {
@@ -483,13 +496,13 @@ scheduleCmd
       const client = CloudClient.fromEnvOrStore();
       if (!client) throw new Error("credentials required (veriflow login or VERIFLOW_API_KEY)");
       const res = await client.request<{
-        due: { flowId: string; name: string; objective: string; envUrl?: string }[];
+        due: { flowId: string; name: string; objective: string; envUrl?: string; retryPolicy?: { maxAttempts: number; backoffSeconds: number } }[];
       }>("POST", "/v1/schedules/claim", {});
       if (!opts.execute) {
         console.log(JSON.stringify(res, null, 2));
         return;
       }
-      const flows = res.due.map((f) => ({ flowId: f.flowId, name: f.name, objective: f.objective, envUrl: f.envUrl }));
+      const flows = res.due.map((f) => ({ flowId: f.flowId, name: f.name, objective: f.objective, envUrl: f.envUrl, retryPolicy: f.retryPolicy }));
       if (!flows.length) {
         console.log(JSON.stringify({ due: 0, ran: 0 }, null, 2));
         return;
@@ -520,7 +533,9 @@ program
       return;
     }
     const suite = await runSuite(
-      chosen.map((f) => ({ flowId: f.id, name: f.name, objective: f.objective, envUrl: f.envUrl })),
+      chosen
+        .filter((f) => !f.quarantined)
+        .map((f) => ({ flowId: f.id, name: f.name, objective: f.objective, envUrl: f.envUrl, retryPolicy: f.retryPolicy })),
       { concurrency: Number(opts.concurrency ?? 4), headless: opts.headless !== false },
     );
     console.log(JSON.stringify(suiteSummary(suite), null, 2));

@@ -18,12 +18,15 @@ import {
   type ProjectRole,
   type ProjectRow,
   type RunRow,
+  type AuditRow,
+  type FlowVersionRow,
   type SessionRow,
   type SpanRow,
   type StepRow,
   type UsageRow,
   type UserProgressRow,
   type UserRow,
+  type WebhookRow,
   type WorkspaceInviteRow,
   type WorkspaceMemberRow,
   type WorkspaceRole,
@@ -95,7 +98,7 @@ export interface CloudStore {
   listFlows(projectId: string): Promise<FlowRow[]>;
   /** Scheduling: claim all flows whose cron is due — atomically per flow.
    *  Returns (flowId, name, objective, envUrl) for the scheduler to execute. */
-  claimDueFlows(projectId: string, now: Date): Promise<{ flowId: string; name: string; objective: string; envUrl?: string; schedule: string }[]>;
+  claimDueFlows(projectId: string, now: Date): Promise<{ flowId: string; name: string; objective: string; envUrl?: string; schedule: string; retryPolicy?: { maxAttempts: number; backoffSeconds: number } }[]>;
   listAllRuns(): Promise<RunRow[]>;
   saveAlertRule(rule: AlertRuleRow): Promise<AlertRuleRow>;
   listAlertRules(projectId: string): Promise<AlertRuleRow[]>;
@@ -124,6 +127,27 @@ export interface CloudStore {
   /** Demo reset: drop every run/step/span/flow/rule/ledger row for a project.
    *  Returns the counts removed so the response can show what was cleared. */
   clearProjectData(projectId: string): Promise<{ runs: number; flows: number; alertRules: number; usage: number }>;
+  // Flow versioning: immutable snapshots with diff + rollback.
+  saveFlowVersion(row: FlowVersionRow): Promise<FlowVersionRow>;
+  listFlowVersions(flowId: string): Promise<FlowVersionRow[]>;
+  getFlowVersion(flowId: string, version: number): Promise<FlowVersionRow | undefined>;
+  markVersionGreen(flowId: string, version: number, runId: string): Promise<void>;
+  // Outbound signed webhooks.
+  saveWebhook(row: WebhookRow): Promise<WebhookRow>;
+  listWebhooks(projectId: string): Promise<WebhookRow[]>;
+  deleteWebhook(projectId: string, id: string): Promise<boolean>;
+  listAllWebhooks(): Promise<WebhookRow[]>;
+  markWebhookDelivery(id: string, ok: boolean, at: string): Promise<void>;
+  // Audit log (append-only).
+  addAudit(row: AuditRow): Promise<void>;
+  listAudit(projectId: string, limit?: number): Promise<AuditRow[]>;
+  // Flake detection: recent run outcomes per flow.
+  listRecentRunsForFlow(flowId: string, limit: number): Promise<RunRow[]>;
+  // Retention: delete evidence blobs + run rows older than the cutoff.
+  purgeRunsBefore(projectId: string, cutoffIso: string): Promise<{ runs: number }>;
+  // Cost cap: total USD spend for a project this month.
+  monthlyCostUsd(projectId: string, monthStartIso: string): Promise<number>;
+  setUserCostCap(userId: string, costCapUsd: number | undefined): Promise<UserRow | undefined>;
 }
 
 interface FileDb {
@@ -147,6 +171,9 @@ interface FileDb {
   userProgress: UserProgressRow[];
   devices: DeviceRow[];
   deviceJobs: DeviceJobRow[];
+  flowVersions: FlowVersionRow[];
+  webhooks: WebhookRow[];
+  audit: AuditRow[];
 }
 
 function emptyDb(): FileDb {
@@ -171,6 +198,9 @@ function emptyDb(): FileDb {
     userProgress: [],
     devices: [],
     deviceJobs: [],
+    flowVersions: [],
+    webhooks: [],
+    audit: [],
   };
 }
 
@@ -500,9 +530,9 @@ export class MemoryStore implements CloudStore {
     return this.db.flows.filter((f) => f.projectId === projectId);
   }
   async claimDueFlows(projectId: string, now: Date) {
-    const due: { flowId: string; name: string; objective: string; envUrl?: string; schedule: string }[] = [];
+    const due: { flowId: string; name: string; objective: string; envUrl?: string; schedule: string; retryPolicy?: { maxAttempts: number; backoffSeconds: number } }[] = [];
     for (const flow of this.db.flows) {
-      if (flow.projectId !== projectId || !flow.schedule) continue;
+      if (flow.projectId !== projectId || !flow.schedule || flow.quarantined) continue;
       let matches = false;
       try {
         matches = cronMatches(parseCron(flow.schedule), now);
@@ -513,7 +543,7 @@ export class MemoryStore implements CloudStore {
       // Claim once per matching minute.
       if (flow.lastScheduledAt === now.toISOString()) continue;
       flow.lastScheduledAt = now.toISOString();
-      due.push({ flowId: flow.id, name: flow.name, objective: flow.objective, envUrl: flow.envUrl, schedule: flow.schedule });
+      due.push({ flowId: flow.id, name: flow.name, objective: flow.objective, envUrl: flow.envUrl, schedule: flow.schedule, retryPolicy: flow.retryPolicy });
     }
     this.touch();
     return due;
@@ -668,8 +698,107 @@ export class MemoryStore implements CloudStore {
     this.db.flows = this.db.flows.filter((f) => f.projectId !== projectId);
     this.db.alertRules = this.db.alertRules.filter((r) => r.projectId !== projectId);
     this.db.usage = this.db.usage.filter((u) => u.projectId !== projectId);
+    this.db.flowVersions = this.db.flowVersions.filter((v) => v.projectId !== projectId);
+    this.db.webhooks = this.db.webhooks.filter((w) => w.projectId !== projectId);
     this.touch();
     return result;
+  }
+
+  // ---- Flow versioning ----
+  async saveFlowVersion(row: FlowVersionRow) {
+    this.db.flowVersions.push(row);
+    this.touch();
+    return row;
+  }
+  async listFlowVersions(flowId: string) {
+    return this.db.flowVersions
+      .filter((v) => v.flowId === flowId)
+      .sort((a, b) => b.version - a.version);
+  }
+  async getFlowVersion(flowId: string, version: number) {
+    return this.db.flowVersions.find((v) => v.flowId === flowId && v.version === version);
+  }
+  async markVersionGreen(flowId: string, version: number, runId: string) {
+    const v = this.db.flowVersions.find((x) => x.flowId === flowId && x.version === version);
+    if (v) {
+      v.lastGreenRunId = runId;
+      this.touch();
+    }
+  }
+
+  // ---- Outbound webhooks ----
+  async saveWebhook(row: WebhookRow) {
+    this.db.webhooks.push(row);
+    this.touch();
+    return row;
+  }
+  async listWebhooks(projectId: string) {
+    return this.db.webhooks.filter((w) => w.projectId === projectId);
+  }
+  async deleteWebhook(projectId: string, id: string) {
+    const before = this.db.webhooks.length;
+    this.db.webhooks = this.db.webhooks.filter((w) => !(w.projectId === projectId && w.id === id));
+    this.touch();
+    return this.db.webhooks.length < before;
+  }
+  async listAllWebhooks() {
+    return [...this.db.webhooks];
+  }
+  async markWebhookDelivery(id: string, ok: boolean, at: string) {
+    const w = this.db.webhooks.find((x) => x.id === id);
+    if (w) {
+      w.lastDeliveryAt = at;
+      w.lastDeliveryOk = ok;
+      this.touch();
+    }
+  }
+
+  // ---- Audit log ----
+  async addAudit(row: AuditRow) {
+    this.db.audit.push(row);
+    // Keep the tail bounded — an audit log is append-only but not unbounded.
+    if (this.db.audit.length > 5000) this.db.audit = this.db.audit.slice(-5000);
+    this.touch();
+  }
+  async listAudit(projectId: string, limit = 100) {
+    return this.db.audit
+      .filter((a) => a.projectId === projectId)
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+      .slice(0, limit);
+  }
+
+  // ---- Flake detection ----
+  async listRecentRunsForFlow(flowId: string, limit: number) {
+    return this.db.runs
+      .filter((r) => r.flowId === flowId)
+      .sort((a, b) => b.startedAt.localeCompare(a.startedAt))
+      .slice(0, limit);
+  }
+
+  // ---- Retention purge ----
+  async purgeRunsBefore(projectId: string, cutoffIso: string) {
+    const doomed = this.db.runs.filter((r) => r.projectId === projectId && r.startedAt < cutoffIso);
+    const ids = new Set(doomed.map((r) => r.id));
+    this.db.runs = this.db.runs.filter((r) => !ids.has(r.id));
+    this.db.steps = this.db.steps.filter((s) => !ids.has(s.runId));
+    this.db.spans = this.db.spans.filter((s) => !ids.has(s.runId));
+    this.db.usage = this.db.usage.filter((u) => !ids.has(u.runId ?? ""));
+    this.touch();
+    return { runs: doomed.length };
+  }
+
+  // ---- Cost cap ----
+  async monthlyCostUsd(projectId: string, monthStartIso: string) {
+    return this.db.usage
+      .filter((u) => u.projectId === projectId && u.unit === "usd" && u.createdAt >= monthStartIso)
+      .reduce((s, u) => s + u.amount, 0);
+  }
+  async setUserCostCap(userId: string, costCapUsd: number | undefined) {
+    const u = this.db.users.find((x) => x.id === userId);
+    if (!u) return undefined;
+    u.costCapUsd = costCapUsd;
+    this.touch();
+    return u;
   }
 }
 

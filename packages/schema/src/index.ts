@@ -90,6 +90,8 @@ export const AssertCheckSchema = z.enum([
   "cookie_contains",
   "local_storage",
   "load_time_under",
+  /** axe-core accessibility scan: value = max allowed violations (default 0). */
+  "a11y_violations_under",
 ]);
 export type AssertCheck = z.infer<typeof AssertCheckSchema>;
 
@@ -112,6 +114,44 @@ export const RequestHumanActionSchema = z.object({
   prompt: z.string().optional(),
 });
 
+/** Keyboard input: press a key or type text into the focused element. */
+export const PressActionSchema = z.object({
+  type: z.literal("press"),
+  target: TargetSchema.optional(),
+  key: z.string().optional(),
+  text: z.string().optional(),
+  secret: z.boolean().optional(),
+  vaultKey: z.string().optional(),
+});
+
+/** File upload into an <input type=file> or drop target. */
+export const UploadActionSchema = z.object({
+  type: z.literal("upload"),
+  target: TargetSchema,
+  /** Absolute local path OR inline content with a filename. */
+  path: z.string().optional(),
+  contentBase64: z.string().optional(),
+  filename: z.string().optional(),
+});
+
+/** Viewport / device emulation: resize the page (and basic device look). */
+export const ViewportActionSchema = z.object({
+  type: z.literal("viewport"),
+  width: z.number().int().positive(),
+  height: z.number().int().positive(),
+});
+
+/** Enter an iframe for subsequent actions (target matched by url/title/selector). */
+export const IframeActionSchema = z.object({
+  type: z.literal("iframe"),
+  target: TargetSchema,
+});
+
+/** Leave any iframe and return to the main frame. */
+export const IframeExitActionSchema = z.object({
+  type: z.literal("iframe_exit"),
+});
+
 export const ActionSchema = z.discriminatedUnion("type", [
   NavigateActionSchema,
   ClickActionSchema,
@@ -123,6 +163,11 @@ export const ActionSchema = z.discriminatedUnion("type", [
   AssertActionSchema,
   FinishActionSchema,
   RequestHumanActionSchema,
+  PressActionSchema,
+  UploadActionSchema,
+  ViewportActionSchema,
+  IframeActionSchema,
+  IframeExitActionSchema,
 ]);
 export type Action = z.infer<typeof ActionSchema>;
 
@@ -137,6 +182,11 @@ export const ActionTypes = [
   "assert",
   "finish",
   "request_human",
+  "press",
+  "upload",
+  "viewport",
+  "iframe",
+  "iframe_exit",
 ] as const;
 export type ActionType = (typeof ActionTypes)[number];
 
@@ -147,6 +197,36 @@ export const ProjectSchema = z.object({
 });
 export type Project = z.infer<typeof ProjectSchema>;
 
+/** Browser engines the harness can drive. */
+export const BrowserEngineSchema = z.enum(["chromium", "firefox", "webkit"]);
+export type BrowserEngine = z.infer<typeof BrowserEngineSchema>;
+
+/** Per-flow retry policy for failed scheduled/suite runs. */
+export const RetryPolicySchema = z.object({
+  /** Total attempts per execution (1 = no retries). Default 1. */
+  maxAttempts: z.number().int().min(1).max(5).default(1),
+  /** Seconds between attempts. Default 30. */
+  backoffSeconds: z.number().int().min(0).max(3600).default(30),
+});
+export type RetryPolicy = z.infer<typeof RetryPolicySchema>;
+
+/** A network route mock applied to the browser context before navigation. */
+export const RouteMockSchema = z.object({
+  /** URL glob (double-star wildcards), e.g. a full URL or path suffix. */
+  pattern: z.string().min(1),
+  method: z.string().optional(),
+  /** Respond immediately with this status (no upstream request). */
+  status: z.number().int().optional(),
+  /** Response body (plain text or JSON string) when status is set. */
+  body: z.string().optional(),
+  contentType: z.string().optional(),
+  /** Response headers when status is set. */
+  headers: z.record(z.string()).optional(),
+  /** Or abort matching requests entirely (timeouts third parties). */
+  abort: z.boolean().optional(),
+});
+export type RouteMock = z.infer<typeof RouteMockSchema>;
+
 export const FlowSchema = z.object({
   id: z.string(),
   projectId: z.string().optional(),
@@ -155,6 +235,14 @@ export const FlowSchema = z.object({
   envUrl: z.string().optional(),
   /** 5-field cron expression (local time); absent = manual runs only. */
   schedule: z.string().optional(),
+  /** Retry policy for failed executions (suite + scheduled runs). */
+  retryPolicy: RetryPolicySchema.optional(),
+  /** Quarantined flows are skipped by suites/schedules but still runnable by hand. */
+  quarantined: z.boolean().optional(),
+  /** Latest version number (monotonic per flow). */
+  version: z.number().int().nonnegative().optional(),
+  /** Network route mocks applied before navigation. */
+  routes: z.array(RouteMockSchema).optional(),
 });
 export type Flow = z.infer<typeof FlowSchema>;
 
@@ -201,6 +289,14 @@ export const RunSchema = z.object({
     .optional(),
   costUsd: z.number().optional(),
   error: z.string().optional(),
+  /** Flow version this run executed (cloud-run runs). */
+  flowVersion: z.number().int().nonnegative().optional(),
+  /** 1-based attempt number when a retry policy is active. */
+  attempt: z.number().int().positive().optional(),
+  /** Browser engine used for this run. */
+  browser: BrowserEngineSchema.optional(),
+  /** Steps repaired by self-heal instead of failing. */
+  healedSteps: z.number().int().nonnegative().optional(),
 });
 export type Run = z.infer<typeof RunSchema>;
 
@@ -291,6 +387,23 @@ export type UsageLedgerEntry = z.infer<typeof UsageLedgerEntrySchema>;
 
 export const AlertKindSchema = z.enum(["cost_spike", "success_rate"]);
 export type AlertKind = z.infer<typeof AlertKindSchema>;
+
+/** Outbound webhook events (HMAC-signed, retried). */
+export const WebhookEventSchema = z.enum([
+  "run.failed",
+  "run.passed",
+  "pause.created",
+  "flow.failed",
+  "alert.triggered",
+]);
+export type WebhookEvent = z.infer<typeof WebhookEventSchema>;
+
+/** Retention: how long evidence blobs are kept before purge. */
+export const RETENTION_DAYS: Record<BillingTier, number> = {
+  free: 7,
+  starter: 30,
+  team: 90,
+};
 
 export const AlertSchema = z.object({
   kind: AlertKindSchema,

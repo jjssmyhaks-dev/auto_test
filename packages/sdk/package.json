@@ -1,0 +1,17 @@
+{
+  "name": "@veriflow/sdk",
+  "version": "0.2.0",
+  "description": "Official TypeScript SDK for the Veriflow cloud API",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}
