@@ -100,6 +100,8 @@ describe("golden flows — auth & navigation (spec 1.8)", () => {
         browser: engine,
         provider: scriptedProvider([...loginSteps(), assertHeading("Dashboard"), done()]),
       });
+      // Print the run error so runner-specific failures are diagnosable from CI logs.
+      if (result.status !== "passed") console.error(`${engine} run failed: ${result.error}`);
       expect(result.status).toBe("passed");
       expect(result.browser).toBe(engine);
     }

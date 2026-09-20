@@ -44,6 +44,10 @@ jobs:
       - name: Install Playwright Chromium + Firefox + WebKit (golden matrix)
         run: pnpm playwright:install chromium firefox webkit
 
+      # Runners ship Chromium's system libs but not Firefox/WebKit's.
+      - name: Install system deps for Firefox/WebKit
+        run: pnpm --filter @veriflow/harness exec playwright install-deps firefox webkit
+
       - name: Dependency audit gate (high+)
         run: pnpm audit --audit-level high
         continue-on-error: true # report first; enforce once Renovate lands the backlog
