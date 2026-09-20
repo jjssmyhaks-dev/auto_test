@@ -1205,9 +1205,16 @@ describe("Veriflow API", () => {
     });
     const flowId = flow.body.flow.id as string;
 
-    // pass-fail-pass-fail → 3 flips over 4 runs → score 1.0.
+    // pass-fail-pass-fail → 3 flips over 4 runs → score 1.0. Explicit ascending
+    // timestamps: same-millisecond runs would make recency order ambiguous.
+    let seq = 0;
     for (const status of ["passed", "failed", "passed", "failed"]) {
-      await json(app, "/v1/runs", { method: "POST", headers: H, body: JSON.stringify({ flowId, objective: "x", status, events: [] }) });
+      const posted = await json(app, "/v1/runs", {
+        method: "POST",
+        headers: H,
+        body: JSON.stringify({ flowId, objective: "x", status, startedAt: new Date(Date.now() + seq++ * 1_000).toISOString(), events: [] }),
+      });
+      expect(posted.status).toBe(200);
     }
     const report = await json(app, `/v1/flows/${flowId}/flake`, { headers: H });
     expect(report.body.runsConsidered).toBe(4);
