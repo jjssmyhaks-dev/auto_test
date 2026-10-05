@@ -217,9 +217,6 @@ CREATE TABLE IF NOT EXISTS rate_limit_windows (
   count INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (key, window_start)
 );
-ALTER TABLE device_jobs ADD COLUMN IF NOT EXISTS run_id TEXT;
-ALTER TABLE device_jobs ADD COLUMN IF NOT EXISTS flow_id TEXT;
-ALTER TABLE device_jobs ADD COLUMN IF NOT EXISTS mode TEXT;
 CREATE TABLE IF NOT EXISTS devices (
   id TEXT PRIMARY KEY,
   project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -239,6 +236,21 @@ CREATE TABLE IF NOT EXISTS device_jobs (
   result_run_id TEXT,
   created_at TEXT NOT NULL
 );
+--ALTERs must follow their table's CREATE (fresh databases run this whole
+-- script top to bottom — an ALTER before the CREATE fails with
+-- "relation does not exist", which is what broke CI on a clean Postgres).
+ALTER TABLE device_jobs ADD COLUMN IF NOT EXISTS run_id TEXT;
+ALTER TABLE device_jobs ADD COLUMN IF NOT EXISTS flow_id TEXT;
+ALTER TABLE device_jobs ADD COLUMN IF NOT EXISTS mode TEXT;
+CREATE TABLE IF NOT EXISTS live_frames (
+  id BIGSERIAL PRIMARY KEY,
+  run_id TEXT NOT NULL,
+  step_index INTEGER,
+  url TEXT,
+  png TEXT,
+  at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS live_frames_run_idx ON live_frames (run_id, id DESC);
 CREATE TABLE IF NOT EXISTS user_progress (
   user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
   onboarding_done JSONB NOT NULL DEFAULT '[]'::jsonb,
