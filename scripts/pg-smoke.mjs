@@ -3,7 +3,6 @@
  * schema migration, and exercises the core CRUD paths — the SQL that unit
  * tests (MemoryStore) can't cover. Exits non-zero on any failure.
  */
-import pg from "pg";
 import { PgRateLimiter, PgStore } from "../apps/api/dist/pg.js";
 import { PgLiveBus } from "../apps/api/dist/live.js";
 
@@ -82,29 +81,25 @@ try {
   const purged = await store.purgeRunsBefore(project.id, new Date(Date.now() + 1000).toISOString());
   if (purged.runs !== 1) throw new Error("purge failed");
 
-  // Multi-replica backends: PG rate limiter + PG live bus (same DB).
-  const pool = new pg.Pool({ connectionString: url });
-  try {
-    const limiter = new PgRateLimiter(pool);
-    const key = `ci:${Date.now()}`;
-    for (let i = 0; i < 3; i++) {
-      const r = await limiter.check(key, 3, 60_000);
-      if (!r.ok) throw new Error("pg rate limiter tripped early");
-    }
-    const blocked = await limiter.check(key, 3, 60_000);
-    if (blocked.ok || blocked.retryAfter <= 0) throw new Error("pg rate limiter did not block over-limit");
-
-    const bus = new PgLiveBus(pool);
-    const frame = { stepIndex: 1, url: "https://example.com", png: Buffer.from("png-bytes"), at: new Date().toISOString() };
-    await bus.pushFrame(`run_ci_${Date.now()}`, frame);
-    const recent = await bus.recentFrames(`run_ci_${Date.now()}`);
-    if (recent.length !== 1 || recent[0].url !== "https://example.com" || recent[0].png.toString() !== "png-bytes") {
-      throw new Error("pg live bus frame round-trip failed");
-    }
-    await bus.close();
-  } finally {
-    await pool.end().catch(() => {});
+  // Multi-replica backends: PG rate limiter + PG live bus, sharing the
+  // store's pool (no direct pg import — pnpm strict deps at the repo root).
+  const limiter = new PgRateLimiter(store.pool);
+  const key = `ci:${Date.now()}`;
+  for (let i = 0; i < 3; i++) {
+    const r = await limiter.check(key, 3, 60_000);
+    if (!r.ok) throw new Error("pg rate limiter tripped early");
   }
+  const blocked = await limiter.check(key, 3, 60_000);
+  if (blocked.ok || blocked.retryAfter <= 0) throw new Error("pg rate limiter did not block over-limit");
+
+  const bus = new PgLiveBus(store.pool);
+  const frame = { stepIndex: 1, url: "https://example.com", png: Buffer.from("png-bytes"), at: new Date().toISOString() };
+  await bus.pushFrame(`run_ci_${Date.now()}`, frame);
+  const frames = await bus.recentFrames(`run_ci_${Date.now()}`);
+  if (frames.length !== 1 || frames[0].url !== "https://example.com" || frames[0].png.toString() !== "png-bytes") {
+    throw new Error("pg live bus frame round-trip failed");
+  }
+  await bus.close();
 
   console.log("pg-smoke OK: users/sessions, flows+versions+green, runs+metadata, webhooks, audit, retention, rate limiter, live bus");
   process.exit(0);
