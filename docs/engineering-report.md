@@ -158,3 +158,11 @@ The device-queue promise is now real end to end (see `docs/gap-analysis.md` for 
 - Claimed jobs carry `runId` (+ `flowId`); `RunOptions.runId` lets the worker execute under the claimed id so `syncRun` updates the dashboard row in place (queued → running → passed/failed).
 - `veriflow device connect` now: claims → executes with live frame push → `syncRun` (events/spans/evidence) → `POST /v1/device-jobs/:id/complete { runId }`.
 - Verified by `scripts/smoke-device.mjs` (9 checks) and a new unit test covering claim-fallback, running-flip, no-double-claim, in-place sync, and completion.
+
+## 11. Trust boundaries, keyless recipes, multi-replica (2026-10-05)
+
+Three hardening passes on top of the closed device loop:
+
+- **Ingest trust boundaries** (`POST /v1/runs`): event shape validation (known event types, ISO timestamps, object payloads), size caps (events/spans/files, 96MB body via hono `bodyLimit`), enum checks for status/browser/attempt, and **server-derived cost** — the harness now emits per-decide `usage`, and the API recomputes `costUsd` from the event log; client claims only apply to legacy streams and never exceed the $50/run ceiling.
+- **Keyless recipe execution**: `runRecipe` (harness) replays a flow's recorded actions verbatim in a real browser — no LLM. `GET /v1/flows/:id/recipe` derives the action list from the last passing run; device jobs carry `mode:"recipe"`; `veriflow recipe <flowId>` runs it from the CLI; the flows page queues recipe jobs. Events/spans/screenshots persist identically to agent runs, so sync/trace/live-view work unchanged.
+- **Multi-replica backends**: `RateLimiter` and `LiveBus` are injectable. `PgRateLimiter` keeps atomic window counters in Postgres; `PgLiveBus` persists frames to a table and fans out via LISTEN/NOTIFY (payload = row id only). `createProductionApp` wires both automatically when `DATABASE_URL` is set. CI's `pg-smoke` exercises limiter + bus against real Postgres.

@@ -610,6 +610,7 @@ export class MemoryStore implements CloudStore {
       claimedAt: new Date().toISOString(),
       runId: run.id,
       flowId: run.flowId,
+      mode: "agent",
       createdAt: new Date().toISOString(),
     };
     this.db.deviceJobs.push(claimed);
@@ -831,22 +832,44 @@ export const QUOTAS = TIER_QUOTAS;
  *  `purgeExpiredSessions` reclaims the rows. */
 export const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 
-/** Fixed-window rate limiter (in-memory, per key). */
-const rateWindows = new Map<string, { count: number; resetAt: number }>();
-export function rateLimit(key: string, limit: number, windowMs: number): { ok: boolean; retryAfter: number } {
-  const now = Date.now();
-  const w = rateWindows.get(key);
-  if (!w || w.resetAt <= now) {
-    rateWindows.set(key, { count: 1, resetAt: now + windowMs });
+/**
+ * Rate limiter backend. The memory implementation is per-process — correct
+ * only for a single API replica. Multi-replica deployments use PgRateLimiter
+ * (see pg.ts), whose counters live in Postgres and are atomic across replicas.
+ */
+export interface RateLimiter {
+  /** Sync for the memory backend; the PG backend is async — callers await. */
+  check(key: string, limit: number, windowMs: number): { ok: boolean; retryAfter: number } | Promise<{ ok: boolean; retryAfter: number }>;
+}
+
+class MemoryRateLimiter implements RateLimiter {
+  private readonly windows = new Map<string, { count: number; resetAt: number }>();
+  check(key: string, limit: number, windowMs: number): { ok: boolean; retryAfter: number } {
+    const now = Date.now();
+    const w = this.windows.get(key);
+    if (!w || w.resetAt <= now) {
+      this.windows.set(key, { count: 1, resetAt: now + windowMs });
+      return { ok: true, retryAfter: 0 };
+    }
+    w.count++;
+    if (w.count > limit) return { ok: false, retryAfter: Math.ceil((w.resetAt - now) / 1000) };
     return { ok: true, retryAfter: 0 };
   }
-  w.count++;
-  if (w.count > limit) return { ok: false, retryAfter: Math.ceil((w.resetAt - now) / 1000) };
-  return { ok: true, retryAfter: 0 };
+  reset() {
+    this.windows.clear();
+  }
+}
+
+/** Shared default (single-replica) limiter. */
+const memoryRateLimiter = new MemoryRateLimiter();
+export const sharedRateLimiter: RateLimiter = memoryRateLimiter;
+
+export function rateLimit(key: string, limit: number, windowMs: number): { ok: boolean; retryAfter: number } {
+  return memoryRateLimiter.check(key, limit, windowMs);
 }
 /** Test hook: clear all rate-limit windows. */
 export function resetRateLimits() {
-  rateWindows.clear();
+  memoryRateLimiter.reset();
 }
 
 export function monthStartIso(now = new Date()): string {

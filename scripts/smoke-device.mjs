@@ -99,6 +99,22 @@ check("steps derived from synced events", Array.isArray(finalRun.body.steps) && 
 const done = await call("POST", `/v1/device-jobs/${job.id}/complete`, { runId }, T);
 check("job completes with result run", done.body.job?.status === "done" && done.body.job?.resultRunId === runId, JSON.stringify(done.body).slice(0, 160));
 
+// ---- 6.5. Keyless recipe: derive from the passing run and queue a recipe job ----
+const flow = await call("POST", "/v1/flows", { name: "recipe flow", objective: "open and assert" }, T);
+const flowId = flow.body.flow.id;
+// The passing run from step 5 becomes the recipe source.
+await call("POST", "/v1/runs", { flowId, objective: "open and assert", status: "passed", stepCount: 2, events: [
+  { type: "run_start", ts: new Date().toISOString(), payload: { objective: "open and assert", envUrl: "https://example.com" } },
+  { type: "decide", ts: new Date().toISOString(), stepIndex: 0, payload: { action: { type: "navigate", url: "https://example.com" } } },
+  { type: "decide", ts: new Date().toISOString(), stepIndex: 1, payload: { action: { type: "assert", check: "heading_contains", target: { selector: "h1" }, value: "Example" } } },
+] }, T);
+const recipe = await call("GET", `/v1/flows/${flowId}/recipe`, undefined, T);
+check("recipe derives actions from the passing run", recipe.status === 200 && recipe.body.actions?.length === 2, JSON.stringify(recipe.body).slice(0, 160));
+const recipeJob = await call("POST", "/v1/device-jobs", { flowId, objective: "open and assert", mode: "recipe" }, T);
+check("recipe job queues with mode=recipe", recipeJob.status === 200 && recipeJob.body.job?.mode === "recipe", JSON.stringify(recipeJob.body).slice(0, 160));
+const claimR = await call("POST", `/v1/devices/${deviceId}/claim`, {}, T);
+check("worker claims recipe job with mode", claimR.body.job?.mode === "recipe" && claimR.body.job?.flowId === flowId, JSON.stringify(claimR.body).slice(0, 160));
+
 // ---- 7. A plain device job still takes priority over queued runs ----
 await call(
   "POST",

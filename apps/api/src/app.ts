@@ -1,10 +1,11 @@
 import { createHash, createHmac, randomUUID } from "node:crypto";
 import { Hono, type Context } from "hono";
 import { cors } from "hono/cors";
+import { bodyLimit } from "hono/body-limit";
 import { RETENTION_DAYS, TIER_QUOTAS, type BillingTier, type Span } from "@veriflow/schema";
 import { spansToOtlp } from "@veriflow/telemetry";
 import { runAgentTest, runRedTeam, parseCron, compareSteps, verifyStripeSignature } from "@veriflow/harness";
-import { rateLimit, SESSION_TTL_MS } from "./store.js";
+import { SESSION_TTL_MS, sharedRateLimiter, type RateLimiter } from "./store.js";
 import { ROLE_RANK, WORKSPACE_ROLE_RANK, type AuditRow, type FlowRow, type MetricRollupRow, type ProjectRole, type WebhookRow, type WorkspaceInviteRow, type WorkspaceRole } from "./auth.js";
 import {
   hashPassword,
@@ -18,7 +19,7 @@ import {
   type StepRow,
 } from "./auth.js";
 import { computeAlerts, MemoryStore, monthStartIso, QUOTAS, type CloudStore } from "./store.js";
-import { pushFrame, recentFrames, subscribe } from "./live.js";
+import { sharedLiveBus, type LiveBus } from "./live.js";
 import { fanOutWebhooks } from "./webhooks.js";
 import { githubActionsWorkflow } from "./workflow.js";
 import type { BlobStore } from "./blobs.js";
@@ -28,6 +29,126 @@ import { FsBlobStore } from "./blobs.js";
 export interface AppDeps {
   store: CloudStore;
   blobs: BlobStore;
+  /** Live-frame backend. Default: in-memory (single replica). PG deployments
+   *  pass a PgLiveBus so frames fan out across replicas. */
+  liveBus?: LiveBus;
+  /** Auth rate limiter backend. Default: in-memory; pass PgRateLimiter for
+   *  multi-replica deployments. */
+  rateLimiter?: RateLimiter;
+}
+
+// ---- Run ingest trust boundaries (POST /v1/runs) ----
+// Workers report results, but the server no longer trusts the wire blindly:
+// events are schema-validated, sizes are capped, and costs are derived from
+// the event log when the worker reports per-step LLM usage.
+
+/** Hard ceiling per run in USD — anything above is rejected, not stored. */
+const MAX_RUN_COST_USD = 50;
+const MAX_INGEST_EVENTS = 2000;
+const MAX_INGEST_SPANS = 2000;
+const MAX_INGEST_FILES = 50;
+const MAX_FILE_B64_BYTES = 8_000_000; // ≈6MB decoded per file
+const MAX_FILES_B64_TOTAL = 64_000_000;
+const MAX_STRING_LEN = 4000;
+const RUN_STATUSES = new Set(["queued", "running", "passed", "failed"]);
+const BROWSERS = new Set(["chromium", "firefox", "webkit"]);
+const EVENT_TYPES = new Set(["run_start", "run_end", "observe", "decide", "guard", "act", "verify", "retry", "human", "log"]);
+
+function isIsoTimestamp(v: unknown): v is string {
+  return typeof v === "string" && v.length <= 40 && !Number.isNaN(Date.parse(v));
+}
+
+/** Validate + normalize the ingest body. Returns an error string or null. */
+function validateRunIngest(body: {
+  objective?: unknown; status?: unknown; error?: unknown; costUsd?: unknown;
+  stepCount?: unknown; attempt?: unknown; browser?: unknown;
+  events?: unknown; spans?: unknown; files?: unknown;
+}): string | null {
+  if (body.objective !== undefined && (typeof body.objective !== "string" || body.objective.length > MAX_STRING_LEN)) {
+    return `objective must be a string ≤ ${MAX_STRING_LEN} chars`;
+  }
+  if (body.status !== undefined && (typeof body.status !== "string" || !RUN_STATUSES.has(body.status))) {
+    return `status must be one of queued|running|passed|failed`;
+  }
+  if (body.error !== undefined && (typeof body.error !== "string" || body.error.length > MAX_STRING_LEN)) {
+    return `error must be a string ≤ ${MAX_STRING_LEN} chars`;
+  }
+  if (body.costUsd !== undefined) {
+    if (typeof body.costUsd !== "number" || !Number.isFinite(body.costUsd) || body.costUsd < 0) {
+      return "costUsd must be a finite number ≥ 0";
+    }
+    if (body.costUsd > MAX_RUN_COST_USD) {
+      return `costUsd exceeds the per-run ceiling (${MAX_RUN_COST_USD} USD)`;
+    }
+  }
+  if (body.stepCount !== undefined && (typeof body.stepCount !== "number" || !Number.isInteger(body.stepCount) || body.stepCount < 0 || body.stepCount > 10_000)) {
+    return "stepCount must be an integer in [0, 10000]";
+  }
+  if (body.attempt !== undefined && (typeof body.attempt !== "number" || !Number.isInteger(body.attempt) || body.attempt < 1 || body.attempt > 100)) {
+    return "attempt must be an integer in [1, 100]";
+  }
+  if (body.browser !== undefined && (typeof body.browser !== "string" || !BROWSERS.has(body.browser))) {
+    return "browser must be chromium, firefox, or webkit";
+  }
+  if (body.events !== undefined) {
+    if (!Array.isArray(body.events)) return "events must be an array";
+    if (body.events.length > MAX_INGEST_EVENTS) return `too many events (max ${MAX_INGEST_EVENTS})`;
+    for (const e of body.events) {
+      if (typeof e !== "object" || e === null) return "each event must be an object";
+      const ev = e as { type?: unknown; ts?: unknown; stepIndex?: unknown; payload?: unknown };
+      if (typeof ev.type !== "string" || !EVENT_TYPES.has(ev.type)) return `unknown event type: ${String(ev.type).slice(0, 40)}`;
+      if (!isIsoTimestamp(ev.ts)) return "event.ts must be an ISO timestamp";
+      if (ev.stepIndex !== undefined && (typeof ev.stepIndex !== "number" || !Number.isInteger(ev.stepIndex) || ev.stepIndex < -1 || ev.stepIndex > 10_000)) {
+        return "event.stepIndex must be an integer in [-1, 10000]";
+      }
+      if (ev.payload !== undefined && (typeof ev.payload !== "object" || ev.payload === null || Array.isArray(ev.payload))) {
+        return "event.payload must be an object";
+      }
+    }
+  }
+  if (body.spans !== undefined) {
+    if (!Array.isArray(body.spans)) return "spans must be an array";
+    if (body.spans.length > MAX_INGEST_SPANS) return `too many spans (max ${MAX_INGEST_SPANS})`;
+  }
+  if (body.files !== undefined) {
+    if (!Array.isArray(body.files)) return "files must be an array";
+    if (body.files.length > MAX_INGEST_FILES) return `too many files (max ${MAX_INGEST_FILES})`;
+    let total = 0;
+    for (const f of body.files) {
+      if (typeof f !== "object" || f === null) return "each file must be an object";
+      const file = f as { path?: unknown; contentBase64?: unknown };
+      if (typeof file.path !== "string" || file.path.length === 0 || file.path.length > 512 || file.path.includes("..")) {
+        return "file.path must be a safe relative path";
+      }
+      if (typeof file.contentBase64 !== "string") return "file.contentBase64 must be a string";
+      total += file.contentBase64.length;
+      if (file.contentBase64.length > MAX_FILE_B64_BYTES) return `file ${file.path.slice(0, 60)} exceeds the size cap`;
+    }
+    if (total > MAX_FILES_B64_TOTAL) return `files exceed the total size cap (${MAX_FILES_B64_TOTAL} base64 bytes)`;
+  }
+  return null;
+}
+
+/**
+ * Server-derived run cost. When the worker reports per-decide LLM usage
+ * (newer harness builds), the total is recomputed from the event log and the
+ * client's top-level claim is ignored; otherwise the (validated) claimed
+ * value is kept for back-compat with older event streams.
+ */
+function deriveCostUsd(events: Array<{ type?: string; payload?: Record<string, unknown> }>, claimed: number | undefined): number | undefined {
+  let derived = 0;
+  let sawUsage = false;
+  for (const e of events) {
+    if (e.type !== "decide") continue;
+    const usage = e.payload?.usage as { costUsd?: unknown } | undefined;
+    const c = usage?.costUsd;
+    if (typeof c === "number" && Number.isFinite(c) && c >= 0) {
+      sawUsage = true;
+      derived += Math.min(c, MAX_RUN_COST_USD);
+    }
+  }
+  if (sawUsage) return Math.round(derived * 1e6) / 1e6;
+  return claimed;
 }
 
 function median(nums: number[]): number {
@@ -114,6 +235,8 @@ function stepsFromEvents(runId: string, events: Array<{ type: string; ts: string
 export function createApp(deps?: Partial<AppDeps>) {
   const store = deps?.store ?? MemoryStore.fromFile(process.env.VERIFLOW_CLOUD_DIR ?? ".veriflow-data");
   const blobs = deps?.blobs ?? new FsBlobStore(process.env.VERIFLOW_BLOBS_DIR ?? ".veriflow-data/blobs");
+  const live = deps?.liveBus ?? sharedLiveBus;
+  const limiter = deps?.rateLimiter ?? sharedRateLimiter;
   const app = new Hono();
   app.use("*", cors());
   // Secure headers: minimal CSP + hardening on every response.
@@ -193,6 +316,7 @@ export function createApp(deps?: Partial<AppDeps>) {
         "/v1/workspaces/{id}/members": { get: {}, post: {} },
         "/v1/workspaces/{id}/usage": { get: {} },
         "/v1/alerts/test": { post: {} },
+        "/v1/flows/{id}/recipe": { get: {} },
         "/v1/devices": { get: {}, post: {} },
         "/v1/devices/{id}/heartbeat": { post: {} },
         "/v1/devices/{id}/claim": { post: {} },
@@ -239,12 +363,13 @@ export function createApp(deps?: Partial<AppDeps>) {
 
   // Fixed-window rate limit for credential endpoints (per IP): 10 attempts
   // per 5 minutes. Returns a 429 response when tripped, else undefined.
-  const authRateLimit = (c: Context) => {
+  // Awaited so the PG-backed limiter (multi-replica) works the same as memory.
+  const authRateLimit = async (c: Context) => {
     const ip =
       c.req.header("x-forwarded-for")?.split(",")[0]?.trim() ||
       (c.env as { incoming?: { socket?: { remoteAddress?: string } } } | undefined)?.incoming?.socket?.remoteAddress ||
       "unknown";
-    const rl = rateLimit(`auth:${ip}`, 10, 5 * 60 * 1000);
+    const rl = await limiter.check(`auth:${ip}`, 10, 5 * 60 * 1000);
     if (!rl.ok) return c.json({ error: "too many attempts", retryAfter: rl.retryAfter }, 429) as unknown as Response;
     return undefined;
   };
@@ -260,7 +385,7 @@ export function createApp(deps?: Partial<AppDeps>) {
   };
 
   app.post("/v1/auth/signup", async (c) => {
-    const limited = authRateLimit(c);
+    const limited = await authRateLimit(c);
     if (limited) return limited;
     const body = (await c.req.json()) as { email?: string; password?: string; setCookie?: boolean };
     if (!body.email || !body.password || body.password.length < 8) {
@@ -322,7 +447,7 @@ export function createApp(deps?: Partial<AppDeps>) {
   });
 
   app.post("/v1/auth/login", async (c) => {
-    const limited = authRateLimit(c);
+    const limited = await authRateLimit(c);
     if (limited) return limited;
     const body = (await c.req.json()) as { email?: string; password?: string; setCookie?: boolean };
     const user = body.email ? await store.getUserByEmail(body.email) : undefined;
@@ -819,7 +944,12 @@ export function createApp(deps?: Partial<AppDeps>) {
     return c.json({ runs });
   });
 
-  app.post("/v1/runs", async (c) => {
+  app.post(
+    "/v1/runs",
+    // Evidence packs are base64-inflated; 96MB covers the 64MB file cap with
+    // JSON headroom. Anything bigger is rejected before parsing into memory.
+    bodyLimit({ maxSize: 96 * 1024 * 1024, onError: (c) => c.json({ error: "payload_too_large" }, 413) }),
+    async (c) => {
     const { ctx, error } = await requireAuth(c);
     if (!ctx) return error;
     const body = (await c.req.json()) as {
@@ -842,6 +972,16 @@ export function createApp(deps?: Partial<AppDeps>) {
       healedSteps?: number;
       heals?: RunRow["heals"];
     };
+    // Trust boundary: shape, sizes, and enums are validated before anything
+    // is written — a malformed or oversized ingest is a 400, not a stored run.
+    const invalid = validateRunIngest(body);
+    if (invalid) return c.json({ error: "invalid_ingest", detail: invalid }, 400);
+    const events = Array.isArray(body.events)
+      ? (body.events as Array<{ type: string; ts: string; stepIndex?: number; payload: Record<string, unknown> }>)
+      : [];
+    // Costs are derived from the event log when the worker reports usage;
+    // the client's top-level claim only applies to legacy event streams.
+    const costUsd = deriveCostUsd(events, body.costUsd);
     const project = await resolveProject(ctx, body.projectId);
     if (!project) return c.json({ error: "no project" }, 400);
     const used = await store.monthlyRunCount(project.id, monthStartIso());
@@ -855,7 +995,7 @@ export function createApp(deps?: Partial<AppDeps>) {
     // Hard cost cap: monthly USD spend for this project, when the user set one.
     if (ctx.user.costCapUsd !== undefined && ctx.user.costCapUsd > 0) {
       const spent = await store.monthlyCostUsd(project.id, monthStartIso());
-      const incoming = body.costUsd ?? 0;
+      const incoming = costUsd ?? 0;
       if (spent + incoming > ctx.user.costCapUsd) {
         return c.json(
           { error: "cost_cap_exceeded", spent, capUsd: ctx.user.costCapUsd, incoming, message: "Monthly cost cap reached — raise it in Settings to continue" },
@@ -874,7 +1014,7 @@ export function createApp(deps?: Partial<AppDeps>) {
       startedAt: body.startedAt ?? new Date().toISOString(),
       endedAt: body.endedAt,
       stepCount: body.stepCount ?? 0,
-      costUsd: body.costUsd,
+      costUsd,
       error: typeof body.error === "string" ? body.error : undefined,
       events: body.events,
       attempt: body.attempt,
@@ -887,8 +1027,7 @@ export function createApp(deps?: Partial<AppDeps>) {
       run.flowVersion = flow?.version;
     }
     await store.upsertRun(run);
-    const events = Array.isArray(body.events) ? (body.events as Parameters<typeof stepsFromEvents>[1]) : [];
-    await store.replaceSteps(runId, stepsFromEvents(runId, events));
+    await store.replaceSteps(runId, stepsFromEvents(runId, events as Parameters<typeof stepsFromEvents>[1]));
     const spans: SpanRow[] = (body.spans ?? []).map((s) => ({
       id: s.id,
       runId,
@@ -910,13 +1049,13 @@ export function createApp(deps?: Partial<AppDeps>) {
       unit: "run",
       createdAt: new Date().toISOString(),
     });
-    if (body.costUsd && body.costUsd > 0) {
+    if (costUsd && costUsd > 0) {
       await store.addUsage({
         id: newId("use"),
         projectId: project.id,
         runId,
         kind: "llm",
-        amount: body.costUsd,
+        amount: costUsd,
         unit: "usd",
         createdAt: new Date().toISOString(),
       });
@@ -956,7 +1095,8 @@ export function createApp(deps?: Partial<AppDeps>) {
       hookWork.catch(() => {}); // background failures must not crash the process
     }
     return c.json({ id: runId, quota: { used: used + 1, limit: quota, tier: ctx.user.tier } });
-  });
+    },
+  );
 
   // Side-by-side run comparison: align steps by index, diff type/status,
   // and surface each side's screenshot blob paths for the filmstrip.
@@ -1051,7 +1191,7 @@ export function createApp(deps?: Partial<AppDeps>) {
     if (denied) return denied;
     const body = (await c.req.json()) as { stepIndex?: number; url?: string; pngBase64?: string };
     if (typeof body.stepIndex !== "number" || !body.pngBase64) return c.json({ error: "stepIndex and pngBase64 required" }, 400);
-    pushFrame(run.id, {
+    await live.pushFrame(run.id, {
       stepIndex: body.stepIndex,
       url: body.url ?? "",
       png: Buffer.from(body.pngBase64, "base64"),
@@ -1086,10 +1226,12 @@ export function createApp(deps?: Partial<AppDeps>) {
         };
         send("hello", { runId, at: new Date().toISOString() });
         // Replay recent frames so a fresh subscriber sees context immediately.
-        for (const f of recentFrames(runId)) {
-          send("frame", { stepIndex: f.stepIndex, url: f.url, pngBase64: f.png.toString("base64"), at: f.at });
-        }
-        const unsub = subscribe(runId, (f) => {
+        void Promise.resolve(live.recentFrames(runId)).then((recent) => {
+          for (const f of recent) {
+            send("frame", { stepIndex: f.stepIndex, url: f.url, pngBase64: f.png.toString("base64"), at: f.at });
+          }
+        });
+        void Promise.resolve(live.subscribe(runId, (f) => {
           send("frame", { stepIndex: f.stepIndex, url: f.url, pngBase64: f.png.toString("base64"), at: f.at });
           if (f.stepIndex < 0) {
             // stepIndex -1 is the end-of-run sentinel.
@@ -1099,15 +1241,16 @@ export function createApp(deps?: Partial<AppDeps>) {
               /* already closed */
             }
           }
+        })).then((unsub) => {
+          // Heartbeat keeps proxies from closing idle streams.
+          const beat = setInterval(() => send("ping", { at: Date.now() }), 15_000);
+          (c as unknown as { _vfCleanup?: (() => void)[] })._vfCleanup = [
+            () => {
+              clearInterval(beat);
+              unsub();
+            },
+          ];
         });
-        // Heartbeat keeps proxies from closing idle streams.
-        const beat = setInterval(() => send("ping", { at: Date.now() }), 15_000);
-        ;(c as unknown as { _vfCleanup?: (() => void)[] })._vfCleanup = [
-          () => {
-            clearInterval(beat);
-            unsub();
-          },
-        ];
       },
       cancel() {
         // covered by _vfCleanup via request abort below
@@ -1443,6 +1586,35 @@ export function createApp(deps?: Partial<AppDeps>) {
     });
   });
 
+  // Keyless recipe: the recorded action sequence of the flow's newest passing
+  // run, replayed verbatim by workers with runRecipe — no LLM key needed.
+  app.get("/v1/flows/:id/recipe", async (c) => {
+    const { ctx, error } = await requireAuth(c);
+    if (!ctx) return error;
+    const flow = (await store.listFlows((await resolveProject(ctx))?.id ?? "")).find((f) => f.id === c.req.param("id"));
+    if (!flow) return c.json({ error: "flow not found" }, 404);
+    const denied = await requireRole(c, flow.projectId, "viewer");
+    if (denied) return denied;
+    const runs = (await store.listRuns(flow.projectId)).filter((r) => r.flowId === flow.id && r.status === "passed" && Array.isArray(r.events));
+    const source = runs.sort((a, b) => (b.endedAt ?? b.startedAt).localeCompare(a.endedAt ?? a.startedAt))[0];
+    if (!source) return c.json({ error: "no passing run to derive a recipe from" }, 404);
+    const events = (source.events ?? []) as Array<{ type?: string; payload?: Record<string, unknown> }>;
+    const actions = events
+      .filter((e) => e.type === "decide")
+      .map((e) => e.payload?.action)
+      .filter((a): a is Record<string, unknown> => Boolean(a) && typeof a === "object" && "type" in (a as object));
+    if (actions.length === 0) return c.json({ error: "no recorded actions in the source run" }, 404);
+    const start = events.find((e) => e.type === "run_start");
+    return c.json({
+      flowId: flow.id,
+      objective: flow.objective,
+      envUrl: source.envUrl ?? (start?.payload?.envUrl as string | undefined),
+      actions,
+      derivedFromRunId: source.id,
+      note: "Deterministic replay: actions run verbatim in a real browser, no LLM.",
+    });
+  });
+
   // Due-claim endpoint for external schedulers (cron, GitHub Actions, K8s
   // CronJob): poll once a minute; every due flow is returned exactly once
   // per matching minute. Then execute each with `veriflow run --flow`.
@@ -1590,19 +1762,23 @@ export function createApp(deps?: Partial<AppDeps>) {
     if (!ctx) return error;
     const project = await resolveProject(ctx);
     if (!project) return c.json({ error: "no project" }, 400);
-    const body = (await c.req.json()) as { objective?: string; envUrl?: string; flowId?: string };
+    const body = (await c.req.json()) as { objective?: string; envUrl?: string; flowId?: string; mode?: string };
     let objective = body.objective;
     if (!objective && body.flowId) {
       const flow = (await store.listFlows(project.id)).find((f) => f.id === body.flowId);
       objective = flow?.objective;
     }
     if (!objective) return c.json({ error: "objective or flowId required" }, 400);
+    const mode = body.mode === "recipe" ? "recipe" : "agent";
+    if (mode === "recipe" && !body.flowId) return c.json({ error: "recipe jobs need flowId" }, 400);
     const job = await store.queueDeviceJob({
       id: newId("job"),
       projectId: project.id,
       objective,
       envUrl: body.envUrl,
       status: "queued",
+      mode,
+      flowId: body.flowId,
       createdAt: new Date().toISOString(),
     });
     return c.json({ job });

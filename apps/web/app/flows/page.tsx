@@ -200,6 +200,21 @@ export default function FlowsPage() {
     }
   }
 
+  // Keyless execution: queues a recipe job that a device worker replays
+  // verbatim (no LLM key needed) from the flow's last passing run.
+  async function runRecipe(flow: Flow) {
+    try {
+      await api("/v1/device-jobs", {
+        method: "POST",
+        body: JSON.stringify({ flowId: flow.id, objective: flow.objective, envUrl: flow.envUrl, mode: "recipe" }),
+      });
+      setNote(`recipe job queued for "${flow.name}" — a connected device replays it without an LLM key`);
+      markAction("queue_run");
+    } catch (e) {
+      setNote(e instanceof Error ? e.message : String(e));
+    }
+  }
+
   if (error) {
     return (
       <AppPage kicker="Flows" title="Saved objectives, ready to re-run.">
@@ -282,6 +297,9 @@ export default function FlowsPage() {
                   <td>
                     <button type="button" onClick={() => rerun(f)}>
                       Queue re-run
+                    </button>{" "}
+                    <button type="button" onClick={() => runRecipe(f)}>
+                      Recipe run (no LLM)
                     </button>{" "}
                     <button type="button" onClick={() => showVersions(f)}>
                       Versions

@@ -321,6 +321,9 @@ export interface DeviceJobRow {
    *  id — the worker executes under it so the dashboard row updates in place. */
   runId?: string;
   flowId?: string;
+  /** "recipe" jobs replay the flow's recorded actions deterministically —
+   *  no LLM key needed on the worker. Default "agent". */
+  mode?: "agent" | "recipe";
   createdAt: string;
 }
 

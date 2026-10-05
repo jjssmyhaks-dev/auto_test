@@ -270,7 +270,9 @@ export async function runHarness(opts: RunOptions): Promise<RunResult> {
       }
       const action = parsed.data;
       decideSpan.end(true, undefined, { actionType: action.type });
-      logger.emit("decide", { action: redactDeep(action, secrets) }, stepIndex, decideSpan.span.id);
+      // usage rides along so the cloud can derive cost server-side from the
+      // event log instead of trusting a top-level client claim.
+      logger.emit("decide", { action: redactDeep(action, secrets), usage: decision.usage }, stepIndex, decideSpan.span.id);
       progress(`▸ step ${stepIndex} decide ${action.type}`);
 
       const guardSpan = spans.start({ runId, kind: "GUARD", attributes: { stepIndex } });

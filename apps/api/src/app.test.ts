@@ -1,7 +1,8 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { createServer } from "node:http";
 import { createApp } from "./app.js";
-import { MemoryStore, resetRateLimits } from "./store.js";
+import { MemoryStore, resetRateLimits, type RateLimiter } from "./store.js";
+import { type LiveBus, type LiveFrame } from "./live.js";
 import { FsBlobStore } from "./blobs.js";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -996,6 +997,106 @@ describe("Veriflow API", () => {
     const doneJob = done.body.job as { status: string; resultRunId?: string };
     expect(doneJob.status).toBe("done");
     expect(doneJob.resultRunId).toBe(runId);
+  });
+
+  it("run ingest enforces trust boundaries: validation, caps, derived cost", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "vf-ingest-"));
+    const app = createApp({ store: new MemoryStore(), blobs: new FsBlobStore(join(dir, "blobs")) });
+    const signup = await json(app, "/v1/auth/signup", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ email: "ingest@example.com", password: "password1" }),
+    });
+    const auth = { authorization: `Bearer ${signup.body.token as string}`, "content-type": "application/json" };
+    const post = (body: unknown) => json(app, "/v1/runs", { method: "POST", headers: auth, body: JSON.stringify(body) });
+
+    // Unknown event types are rejected.
+    const badType = await post({ objective: "x", status: "passed", events: [{ type: "pwn", ts: new Date().toISOString(), payload: {} }] });
+    expect(badType.status).toBe(400);
+    expect(badType.body.error).toBe("invalid_ingest");
+
+    // Malformed timestamps are rejected.
+    const badTs = await post({ objective: "x", status: "passed", events: [{ type: "decide", ts: "not-a-date", payload: {} }] });
+    expect(badTs.status).toBe(400);
+
+    // Negative and absurd costs are rejected.
+    const neg = await post({ objective: "x", status: "passed", costUsd: -1 });
+    expect(neg.status).toBe(400);
+    const absurd = await post({ objective: "x", status: "passed", costUsd: 999 });
+    expect(absurd.status).toBe(400);
+
+    // Event count cap.
+    const tooMany = await post({
+      objective: "x",
+      status: "passed",
+      events: Array.from({ length: 2001 }, (_, i) => ({ type: "log", ts: new Date().toISOString(), payload: { i } })),
+    });
+    expect(tooMany.status).toBe(400);
+
+    // Unsafe file paths are rejected.
+    const evilPath = await post({ objective: "x", status: "passed", files: [{ path: "../../etc/passwd", contentBase64: "aGk=" }] });
+    expect(evilPath.status).toBe(400);
+
+    // Cost is derived from decide-event usage; the client's claim is ignored.
+    const derived = await post({
+      objective: "x",
+      status: "passed",
+      costUsd: 0.01,
+      events: [
+        { type: "decide", ts: new Date().toISOString(), stepIndex: 0, payload: { action: { type: "open", url: "https://example.com" }, usage: { input: 100, output: 50, costUsd: 0.0025 } } },
+        { type: "decide", ts: new Date().toISOString(), stepIndex: 1, payload: { action: { type: "finish", success: true, reason: "ok" }, usage: { input: 100, output: 50, costUsd: 0.0075 } } },
+        { type: "run_end", ts: new Date().toISOString(), payload: { status: "passed", steps: 2 } },
+      ],
+    });
+    expect(derived.status).toBe(200);
+    const got = await json(app, `/v1/runs/${derived.body.id}`, { headers: auth });
+    expect((got.body.run as { costUsd?: number }).costUsd).toBe(0.01); // 0.0025 + 0.0075
+
+    // Legacy streams without usage keep the (validated) claimed cost.
+    const legacy = await post({ objective: "x", status: "passed", costUsd: 0.5, events: [{ type: "run_end", ts: new Date().toISOString(), payload: { status: "passed" } }] });
+    expect(legacy.status).toBe(200);
+    const gotLegacy = await json(app, `/v1/runs/${legacy.body.id}`, { headers: auth });
+    expect((gotLegacy.body.run as { costUsd?: number }).costUsd).toBe(0.5);
+  });
+
+  it("multi-replica backends: injected rate limiter and live bus are honored", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "vf-di-"));
+    // Always-block limiter: signup/login must 429 through the injected backend.
+    const alwaysBlock: RateLimiter = { check: () => ({ ok: false, retryAfter: 9 }) };
+    const blockedApp = createApp({ store: new MemoryStore(), blobs: new FsBlobStore(join(dir, "blobs")), rateLimiter: alwaysBlock });
+    const denied = await json(blockedApp, "/v1/auth/signup", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ email: "blocked@example.com", password: "password1" }),
+    });
+    expect(denied.status).toBe(429);
+
+    // Injected live bus receives frames pushed through the API.
+    const frames: Array<{ runId: string; frame: LiveFrame }> = [];
+    const bus: LiveBus = {
+      pushFrame(runId, frame) {
+        frames.push({ runId, frame });
+      },
+      subscribe: () => () => undefined,
+      recentFrames: () => [],
+    };
+    const app = createApp({ store: new MemoryStore(), blobs: new FsBlobStore(join(dir, "blobs2")), liveBus: bus });
+    const signup = await json(app, "/v1/auth/signup", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ email: "di@example.com", password: "password1" }),
+    });
+    const auth = { authorization: `Bearer ${signup.body.token as string}`, "content-type": "application/json" };
+    const run = await json(app, "/v1/runs", { method: "POST", headers: auth, body: JSON.stringify({ objective: "x", status: "passed" }) });
+    const push = await json(app, `/v1/runs/${run.body.id}/frames`, {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({ stepIndex: 0, url: "https://example.com", pngBase64: Buffer.from("x").toString("base64") }),
+    });
+    expect(push.status).toBe(200);
+    expect(frames).toHaveLength(1);
+    expect(frames[0].runId).toBe(run.body.id);
+    expect(frames[0].frame.stepIndex).toBe(0);
   });
 
   it("redteam endpoint ingests a probe run (safe stub => green)", async () => {

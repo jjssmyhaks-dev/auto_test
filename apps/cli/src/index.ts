@@ -11,6 +11,7 @@ import {
   replayLive,
   runAgentTest,
   runHarness,
+  runRecipe,
   runRedTeam,
   runReliability,
   runSuite,
@@ -185,6 +186,57 @@ program
         if (result.evidencePath) console.log(`evidence ${result.evidencePath}`);
         if (result.reportPath) console.log(`report ${result.reportPath}`);
       }
+      if (opts.sync) {
+        const sync = await syncRunIfConfigured(result.runId);
+        console.log(`sync ${sync.synced ? "ok" : "skipped"} ${sync.detail}`);
+      }
+      process.exitCode = result.status === "passed" ? 0 : 1;
+    } catch (err) {
+      console.error(err instanceof Error ? err.message : err);
+      process.exitCode = 1;
+    }
+  });
+
+program
+  .command("recipe")
+  .description("Run a cloud flow's recorded actions deterministically — no LLM key needed")
+  .argument("<flowId>", "Flow id (fetches the recipe from the API)")
+  .option("--env <url>", "Override the starting environment URL")
+  .option("--headless", "Run headless (default true; --no-headless to watch)", true)
+  .option("--sync", "Push the result to the cloud after the run", false)
+  .action(async (flowId: string, opts: { env?: string; headless?: boolean; sync?: boolean }) => {
+    try {
+      const client = CloudClient.fromEnvOrStore();
+      if (!client) {
+        console.error("credentials required (veriflow login or VERIFLOW_API_KEY)");
+        process.exitCode = 1;
+        return;
+      }
+      const recipe = await client.request<{
+        actions: unknown[];
+        envUrl?: string;
+        objective?: string;
+        derivedFromRunId?: string;
+      }>("GET", `/v1/flows/${encodeURIComponent(flowId)}/recipe`);
+      console.error(`recipe: ${recipe.actions.length} actions${recipe.derivedFromRunId ? ` (from ${recipe.derivedFromRunId})` : ""}`);
+      // Live frames when the run row is reserved — the dashboard watches.
+      let liveRunId: string | undefined;
+      const result = await runRecipe({
+        actions: recipe.actions as never[],
+        envUrl: opts.env ?? recipe.envUrl,
+        headless: opts.headless !== false,
+        objective: recipe.objective,
+        onStart: ({ runId }) => {
+          liveRunId = runId;
+        },
+        onFrame: ({ stepIndex, png, url }) => {
+          const id = liveRunId;
+          if (!id) return;
+          void client.request("POST", `/v1/runs/${id}/frames`, { stepIndex, url, pngBase64: png.toString("base64") }).catch(() => undefined);
+        },
+      });
+      console.log(`run ${result.runId} ${result.status} (passed ${result.passed}, failed ${result.failed}, skipped ${result.skipped})`);
+      if (result.error) console.log(result.error);
       if (opts.sync) {
         const sync = await syncRunIfConfigured(result.runId);
         console.log(`sync ${sync.synced ? "ok" : "skipped"} ${sync.detail}`);
@@ -624,13 +676,13 @@ deviceCmd
       try {
         await client.request("POST", `/v1/devices/${reg.device.id}/heartbeat`, { status: "online" });
         const claim = await client.request<{
-          job?: { id: string; flowId?: string; objective: string; envUrl?: string; runId?: string } | null;
+          job?: { id: string; flowId?: string; objective: string; envUrl?: string; runId?: string; mode?: "agent" | "recipe" } | null;
         }>("POST", `/v1/devices/${reg.device.id}/claim`, {});
         if (claim.job) {
           const job = claim.job;
-          console.log(`→ job ${job.id}: ${job.objective.slice(0, 60)}${job.runId ? ` (run ${job.runId})` : ""}`);
-          // Stream live frames to the dashboard while the agent works. The run
-          // row already exists (device jobs materialized from queued cloud
+          console.log(`→ job ${job.id}: ${job.objective.slice(0, 60)}${job.runId ? ` (run ${job.runId})` : ""}${job.mode === "recipe" ? " [recipe]" : ""}`);
+          // Stream live frames to the dashboard while the work executes. The
+          // run row already exists (device jobs materialized from queued cloud
           // runs) or is reserved by onStart — frames attach to whichever id.
           let liveRunId: string | undefined;
           const liveHooks = {
@@ -645,26 +697,48 @@ deviceCmd
                 .catch(() => undefined);
             },
           };
-          // When the job came from a queued cloud run, execute under the same
-          // run id so the sync updates the dashboard row in place.
-          const result = await runHarness({
-            objective: job.objective,
-            envUrl: job.envUrl,
-            headless: true,
-            runId: job.runId,
-            ...liveHooks,
-          });
-          console.log(`  done: ${result.status}`);
+          // Recipe jobs replay the flow's recorded actions verbatim — no LLM
+          // key needed on the worker at all.
+          let status: string;
+          let resultRunId: string;
+          if (job.mode === "recipe" && job.flowId) {
+            const recipe = await client.request<{
+              actions: unknown[];
+              envUrl?: string;
+            }>("GET", `/v1/flows/${encodeURIComponent(job.flowId)}/recipe`);
+            const res = await runRecipe({
+              actions: recipe.actions as never[],
+              envUrl: job.envUrl ?? recipe.envUrl,
+              headless: true,
+              objective: job.objective,
+              ...liveHooks,
+            });
+            status = res.status;
+            resultRunId = res.runId;
+          } else {
+            // When the job came from a queued cloud run, execute under the same
+            // run id so the sync updates the dashboard row in place.
+            const result = await runHarness({
+              objective: job.objective,
+              envUrl: job.envUrl,
+              headless: true,
+              runId: job.runId,
+              ...liveHooks,
+            });
+            status = result.status;
+            resultRunId = result.runId;
+          }
+          console.log(`  done: ${status}`);
           // Close the loop: ingest the full result (events, spans, evidence)
           // and mark the job done so the dashboard shows the result run.
           try {
-            await client.syncRun(result.runId);
+            await client.syncRun(resultRunId);
           } catch (err) {
             console.error(`  sync failed: ${err instanceof Error ? err.message : err}`);
           }
           try {
             await client.request("POST", `/v1/device-jobs/${encodeURIComponent(job.id)}/complete`, {
-              runId: result.runId,
+              runId: resultRunId,
             });
           } catch (err) {
             console.error(`  complete failed: ${err instanceof Error ? err.message : err}`);

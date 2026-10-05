@@ -211,8 +211,15 @@ ALTER TABLE flows ADD COLUMN IF NOT EXISTS retry_policy JSONB;
 ALTER TABLE flows ADD COLUMN IF NOT EXISTS quarantined BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE flows ADD COLUMN IF NOT EXISTS version INTEGER NOT NULL DEFAULT 1;
 ALTER TABLE flows ADD COLUMN IF NOT EXISTS routes JSONB;
+CREATE TABLE IF NOT EXISTS rate_limit_windows (
+  key TEXT NOT NULL,
+  window_start TEXT NOT NULL,
+  count INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (key, window_start)
+);
 ALTER TABLE device_jobs ADD COLUMN IF NOT EXISTS run_id TEXT;
 ALTER TABLE device_jobs ADD COLUMN IF NOT EXISTS flow_id TEXT;
+ALTER TABLE device_jobs ADD COLUMN IF NOT EXISTS mode TEXT;
 CREATE TABLE IF NOT EXISTS devices (
   id TEXT PRIMARY KEY,
   project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -264,6 +271,7 @@ function mapDeviceJob(r: pg.QueryResultRow): DeviceJobRow {
     resultRunId: r.result_run_id ?? undefined,
     runId: r.run_id ?? undefined,
     flowId: r.flow_id ?? undefined,
+    mode: (r.mode === "recipe" ? "recipe" : r.mode === "agent" ? "agent" : undefined),
     createdAt: r.created_at,
   };
 }
@@ -327,7 +335,13 @@ export class PgStore implements CloudStore {
     await this.pool.end();
   }
 
-  constructor(private readonly pool: pg.Pool) {}
+  /** Exposed so multi-replica infrastructure (rate limiter, live bus) can
+   *  share this pool instead of opening its own connections. */
+  readonly pool: pg.Pool;
+
+  constructor(pool: pg.Pool) {
+    this.pool = pool;
+  }
 
   static async connect(url: string): Promise<PgStore> {
     const pool = new pg.Pool({ connectionString: url });
@@ -1061,8 +1075,8 @@ export class PgStore implements CloudStore {
   }
   async queueDeviceJob(row: DeviceJobRow): Promise<DeviceJobRow> {
     await this.pool.query(
-      `INSERT INTO device_jobs (id, project_id, objective, env_url, status, run_id, flow_id, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-      [row.id, row.projectId, row.objective, row.envUrl ?? null, row.status, row.runId ?? null, row.flowId ?? null, row.createdAt],
+      `INSERT INTO device_jobs (id, project_id, objective, env_url, status, run_id, flow_id, mode, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+      [row.id, row.projectId, row.objective, row.envUrl ?? null, row.status, row.runId ?? null, row.flowId ?? null, row.mode ?? "agent", row.createdAt],
     );
     return row;
   }
@@ -1093,8 +1107,8 @@ export class PgStore implements CloudStore {
     const run = runRes.rows[0];
     if (!run) return undefined;
     const jobRes = await this.pool.query(
-      `INSERT INTO device_jobs (id, project_id, objective, env_url, status, claimed_by, claimed_at, run_id, flow_id, created_at)
-       VALUES ($1,$2,$3,$4,'claimed',$5,$6,$7,$8,$6) RETURNING *`,
+      `INSERT INTO device_jobs (id, project_id, objective, env_url, status, claimed_by, claimed_at, run_id, flow_id, mode, created_at)
+       VALUES ($1,$2,$3,$4,'claimed',$5,$6,$7,$8,'agent',$6) RETURNING *`,
       [newId("job"), device.projectId, run.objective || "(no objective)", run.env_url ?? null, deviceId, new Date().toISOString(), run.id, run.flow_id ?? null],
     );
     return jobRes.rows[0] ? mapDeviceJob(jobRes.rows[0]) : undefined;
@@ -1308,5 +1322,36 @@ export async function tryPgStore(url?: string): Promise<PgStore | undefined> {
   } catch (err) {
     console.warn("Postgres unavailable, falling back to filesystem store:", err instanceof Error ? err.message : err);
     return undefined;
+  }
+}
+
+/**
+ * Postgres-backed fixed-window rate limiter. Counters live in a single table
+ * and are incremented with an atomic upsert, so N API replicas share one
+ * budget per key. Stale windows are swept lazily by the check path.
+ */
+export class PgRateLimiter {
+  constructor(private readonly pool: pg.Pool) {}
+
+  async check(key: string, limit: number, windowMs: number): Promise<{ ok: boolean; retryAfter: number }> {
+    const now = Date.now();
+    const windowStart = Math.floor(now / windowMs) * windowMs;
+    const res = await this.pool.query(
+      `INSERT INTO rate_limit_windows (key, window_start, count)
+       VALUES ($1, $2, 1)
+       ON CONFLICT (key, window_start) DO UPDATE SET count = rate_limit_windows.count + 1
+       RETURNING count`,
+      [key, new Date(windowStart).toISOString()],
+    );
+    // Opportunistic sweep (cheap, keeps the table bounded without a cron).
+    if (Math.random() < 0.02) {
+      await this.pool.query(`DELETE FROM rate_limit_windows WHERE window_start < $1`, [new Date(now - 2 * windowMs).toISOString()]).catch(() => undefined);
+    }
+    const count = Number(res.rows[0]?.count ?? 1);
+    if (count > limit) {
+      const resetAt = windowStart + windowMs;
+      return { ok: false, retryAfter: Math.max(1, Math.ceil((resetAt - now) / 1000)) };
+    }
+    return { ok: true, retryAfter: 0 };
   }
 }

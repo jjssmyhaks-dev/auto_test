@@ -4,6 +4,8 @@ export { compactTree } from "./a11y.js";
 export type { A11yNode, A11ySnapshot } from "./a11y.js";
 export { runHarness, defaultStdinPause } from "./loop.js";
 export type { RunOptions, RunResult } from "./loop.js";
+export { runRecipe } from "./recipe.js";
+export type { RecipeOptions, RecipeResult } from "./recipe.js";
 export type { ConversationHarness } from "./agent-test.js";
 export {
   runAgentTest,

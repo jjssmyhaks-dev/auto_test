@@ -1,6 +1,6 @@
 # Veriflow — gap analysis to world-class
 
-Updated: 2026-10-05. Everything below is verified against the code, not guessed.
+Updated: 2026-10-05 (second pass). Everything below is verified against the code, not guessed.
 
 ## Legend
 
@@ -16,21 +16,27 @@ Updated: 2026-10-05. Everything below is verified against the code, not guessed.
 | Dashboard queue and device queue were two disconnected systems | Runs queued from the web UI (`POST /v1/runs status:"queued"`) were never claimable — device claim only served explicit device jobs | `claimDeviceJob` (Memory + PG, atomic in PG) now falls back to claiming the oldest queued cloud run; the worker executes under the **same run id** (`runHarness({ runId })`), so the dashboard row updates in place: queued → running → passed/failed |
 | Device workers streamed no live frames | Foreground `veriflow run --live` pushed frames, but `device connect` did not | Device workers now push frames per step (best-effort), so dashboard live view works for device-executed runs too |
 
+## Closed in the second pass (2026-10-05, later commits)
+
+| Gap | Fix |
+| --- | --- |
+| 🔴 Run ingest was trust-on-arrival | `POST /v1/runs` now validates event shape (known types, ISO timestamps, payload objects), enforces size caps (≤2k events, ≤2k spans, ≤50 files with per-file and total caps, 96MB body limit via `bodyLimit`), validates status/browser/attempt enums, and **derives cost server-side** from per-decide `usage` events the harness now emits — the client's top-level `costUsd` claim is only honored for legacy event streams, and never outside `[0, $50]` |
+| 🔴 No keyless execution | Deterministic **recipe runs**: the flow's last passing run derives an action list (`GET /v1/flows/:id/recipe`), `runRecipe` in the harness replays it verbatim in a real browser with zero LLM calls, device jobs carry `mode:"recipe"`, workers fetch + execute + sync, and the flows page has a "Recipe run (no LLM)" button. CLI: `veriflow recipe <flowId>` |
+| 🟡 Single replica only | `RateLimiter` and `LiveBus` are now injectable backends: `PgRateLimiter` (atomic `INSERT … ON CONFLICT … RETURNING` counters, swept lazily) and `PgLiveBus` (frames in a PG table, fan-out via `LISTEN/NOTIFY` — notifications carry only the row id, far under the 8KB limit). Wired automatically in `index.ts` when `DATABASE_URL` is set; covered by `scripts/pg-smoke.mjs` in CI |
+
 ## Remaining gaps
 
 ### 🔴 Real-user blockers
 
-1. **Browser execution needs an LLM key on the worker.** `runHarness` is agent-driven (`ANTHROPIC_API_KEY`/`OPENAI_API_KEY`); there is no managed key by design (BYOK). A user with no key anywhere cannot execute agent runs. Deterministic `replayLive` exists but only replays previously-recorded action sequences. *Options:* flow-step "recipes" (explicit steps, no LLM), or a hosted-worker tier.
-2. **Single replica only.** The API holds hot state in process: `MemoryStore` (default when `DATABASE_URL` is unset), the fixed-window rate limiter (`apps/api/src/store.ts` `rateLimit`), and the SSE live bus (`apps/api/src/live.ts` `recentFrames`/`subscribe`). Two API replicas behind a load balancer will drop frames, double-serve rate budgets, and split state. PG covers persistence but not these three.
-3. **Run ingest is trust-on-arrival.** `POST /v1/runs` accepts any `status`/`events`/`costUsd` from any authenticated project member. A worker bug (or bad actor) can mark flaky flows green. *Options:* server-side re-verification, event schema validation with size caps, and per-key ingest signing.
+1. **Agent runs still need an LLM key on the worker** (recipes and replays are keyless now, but first-run discovery is agent-driven). A hosted-worker tier or bundled default recipes would close this.
 
 ### 🟡 Scale / production hardening
 
-4. **Secrets in vault are local-only.** The CLI vault encrypts to a local file; cloud runs on other machines can't resolve `vaultKey` fills unless the secret is re-entered there. No cloud KMS/secret store integration.
-5. **Email delivery via inline SMTP client** (`apps/api/src/deliver.ts`) — works but speaking raw SMTP from the API will trip SPF/DKIM/DMARC for real domains. Use an HTTP relay (Resend/SES/Postmark) in production: `VERIFLOW_EMAIL_ENDPOINT` already exists as the seam.
-6. **Stripe tier-flip depends on webhook delivery.** Live Checkout + signature-verified webhook are real; there's no reconciliation job if a webhook is missed (no periodic Stripe sync of subscription status).
-7. **Retention/audit coverage**: retention purge and audit log exist for core rows, but new tables added later must be added to both the purge routine and PG migrations (they're hand-maintained).
-8. **Observability of the platform itself**: no error tracking (Sentry-class), no product analytics, no structured server logs/metrics endpoint beyond `/health`. When a user's run fails at the API level, there's no trail.
+2. **Secrets in vault are local-only.** The CLI vault encrypts to a local file; cloud runs on other machines can't resolve `vaultKey` fills unless the secret is re-entered there. No cloud KMS/secret store integration.
+3. **Email delivery via inline SMTP client** (`apps/api/src/deliver.ts`) — works but speaking raw SMTP from the API will trip SPF/DKIM/DMARC for real domains. Use an HTTP relay (Resend/SES/Postmark) in production: `VERIFLOW_EMAIL_ENDPOINT` already exists as the seam.
+4. **Stripe tier-flip depends on webhook delivery.** Live Checkout + signature-verified webhook are real; there's no reconciliation job if a webhook is missed (no periodic Stripe sync of subscription status).
+5. **Retention/audit coverage**: retention purge and audit log exist for core rows, but new tables added later must be added to both the purge routine and PG migrations (they're hand-maintained — e.g. `live_frames`/`rate_limit_windows` are self-sweeping, but check new tables).
+6. **Observability of the platform itself**: no error tracking (Sentry-class), no product analytics, no structured server logs/metrics endpoint beyond `/health`. When a user's run fails at the API level, there's no trail.
 
 ### 🟢 Competitive parity / growth
 

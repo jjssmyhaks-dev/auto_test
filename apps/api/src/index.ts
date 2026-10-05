@@ -5,7 +5,8 @@ import { homedir } from "node:os";
 import { createApp } from "./app.js";
 import { MemoryStore } from "./store.js";
 import { createBlobStore } from "./blobs.js";
-import { tryPgStore } from "./pg.js";
+import { PgLiveBus } from "./live.js";
+import { PgRateLimiter, tryPgStore } from "./pg.js";
 
 export { createApp } from "./app.js";
 
@@ -17,6 +18,16 @@ export async function createProductionApp() {
       process.env.VERIFLOW_CLOUD_DIR ?? join(homedir(), ".veriflow", "cloud-data"),
     );
   const blobs = await createBlobStore();
+  // Multi-replica backends ride the same Postgres pool as the store: the
+  // auth rate limiter shares one budget per key across replicas, and live
+  // frames fan out via LISTEN/NOTIFY so SSE viewers on any replica see them.
+  if (pg) {
+    const rateLimiter = {
+      check: (key: string, limit: number, windowMs: number) => new PgRateLimiter(pg.pool).check(key, limit, windowMs),
+    };
+    const liveBus = new PgLiveBus(pg.pool);
+    return createApp({ store, blobs, rateLimiter, liveBus });
+  }
   return createApp({ store, blobs });
 }
 
