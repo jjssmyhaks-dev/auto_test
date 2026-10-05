@@ -583,15 +583,38 @@ export class MemoryStore implements CloudStore {
     device.status = "online";
     device.lastHeartbeatAt = new Date().toISOString();
     const job = this.db.deviceJobs.find((j) => j.projectId === device.projectId && j.status === "queued");
-    if (!job) {
+    if (job) {
+      job.status = "claimed";
+      job.claimedBy = deviceId;
+      job.claimedAt = new Date().toISOString();
+      this.touch();
+      return job;
+    }
+    // Fallback: no queued jobs — claim the oldest queued cloud run instead so
+    // dashboard-queued runs are executable by connected devices too.
+    const run = this.db.runs
+      .filter((r) => r.projectId === device.projectId && r.status === "queued")
+      .sort((a, b) => a.startedAt.localeCompare(b.startedAt))[0];
+    if (!run) {
       this.touch();
       return undefined;
     }
-    job.status = "claimed";
-    job.claimedBy = deviceId;
-    job.claimedAt = new Date().toISOString();
+    run.status = "running";
+    const claimed: DeviceJobRow = {
+      id: newId("job"),
+      projectId: device.projectId,
+      objective: run.objective || "(no objective)",
+      envUrl: run.envUrl,
+      status: "claimed",
+      claimedBy: deviceId,
+      claimedAt: new Date().toISOString(),
+      runId: run.id,
+      flowId: run.flowId,
+      createdAt: new Date().toISOString(),
+    };
+    this.db.deviceJobs.push(claimed);
     this.touch();
-    return job;
+    return claimed;
   }
   async completeDeviceJob(id: string, resultRunId: string) {
     const job = this.db.deviceJobs.find((j) => j.id === id);

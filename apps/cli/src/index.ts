@@ -623,15 +623,52 @@ deviceCmd
     for (;;) {
       try {
         await client.request("POST", `/v1/devices/${reg.device.id}/heartbeat`, { status: "online" });
-        const claim = await client.request<{ job?: { flowId: string; objective: string; envUrl?: string } | null }>(
-          "POST",
-          `/v1/devices/${reg.device.id}/claim`,
-          {},
-        );
+        const claim = await client.request<{
+          job?: { id: string; flowId?: string; objective: string; envUrl?: string; runId?: string } | null;
+        }>("POST", `/v1/devices/${reg.device.id}/claim`, {});
         if (claim.job) {
-          console.log(`→ job: ${claim.job.objective.slice(0, 60)}`);
-          const result = await runHarness({ objective: claim.job.objective, envUrl: claim.job.envUrl, headless: true });
+          const job = claim.job;
+          console.log(`→ job ${job.id}: ${job.objective.slice(0, 60)}${job.runId ? ` (run ${job.runId})` : ""}`);
+          // Stream live frames to the dashboard while the agent works. The run
+          // row already exists (device jobs materialized from queued cloud
+          // runs) or is reserved by onStart — frames attach to whichever id.
+          let liveRunId: string | undefined;
+          const liveHooks = {
+            onStart: ({ runId }: { runId: string; objective: string }) => {
+              liveRunId = runId;
+            },
+            onFrame: ({ stepIndex, png, url }: { stepIndex: number; png: Buffer; url: string }) => {
+              const id = liveRunId;
+              if (!id) return;
+              void client
+                .request("POST", `/v1/runs/${id}/frames`, { stepIndex, url, pngBase64: png.toString("base64") })
+                .catch(() => undefined);
+            },
+          };
+          // When the job came from a queued cloud run, execute under the same
+          // run id so the sync updates the dashboard row in place.
+          const result = await runHarness({
+            objective: job.objective,
+            envUrl: job.envUrl,
+            headless: true,
+            runId: job.runId,
+            ...liveHooks,
+          });
           console.log(`  done: ${result.status}`);
+          // Close the loop: ingest the full result (events, spans, evidence)
+          // and mark the job done so the dashboard shows the result run.
+          try {
+            await client.syncRun(result.runId);
+          } catch (err) {
+            console.error(`  sync failed: ${err instanceof Error ? err.message : err}`);
+          }
+          try {
+            await client.request("POST", `/v1/device-jobs/${encodeURIComponent(job.id)}/complete`, {
+              runId: result.runId,
+            });
+          } catch (err) {
+            console.error(`  complete failed: ${err instanceof Error ? err.message : err}`);
+          }
         }
       } catch (err) {
         console.error(err instanceof Error ? err.message : err);

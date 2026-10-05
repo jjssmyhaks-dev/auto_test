@@ -317,6 +317,10 @@ export interface DeviceJobRow {
   claimedBy?: string;
   claimedAt?: string;
   resultRunId?: string;
+  /** When the job was materialized from a queued cloud run, this is that run's
+   *  id — the worker executes under it so the dashboard row updates in place. */
+  runId?: string;
+  flowId?: string;
   createdAt: string;
 }
 

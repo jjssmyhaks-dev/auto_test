@@ -19,6 +19,9 @@ import { attachDevtoolsCapture, emptyCapture, type DevtoolsCapture } from "./dev
 export interface RunOptions {
   objective: string;
   envUrl?: string;
+  /** Reuse an existing run id — device workers claim a queued cloud run and
+   *  execute it under the same id so the sync updates that row. */
+  runId?: string;
   headless?: boolean;
   profile?: string;
   record?: boolean;
@@ -109,7 +112,7 @@ export async function runHarness(opts: RunOptions): Promise<RunResult> {
   const envUrl = opts.envUrl ?? profileEnv ?? config.defaultEnvUrl;
   const captureOn = Boolean(opts.captureDevtools ?? config.captureDevtools);
   const otlpOn = Boolean(opts.otlp ?? config.otlpExport);
-  const runId = `run_${randomUUID()}`;
+  const runId = opts.runId ?? `run_${randomUUID()}`;
   const rp = ensureRunDir(runId, home);
   try {
     await opts.onStart?.({ runId, objective: opts.objective });

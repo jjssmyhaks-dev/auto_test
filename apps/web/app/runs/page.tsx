@@ -45,7 +45,7 @@ export default function RunsPage() {
         body: JSON.stringify({ objective, envUrl, status: "queued", stepCount: 0 }),
       });
       setDraft("");
-      setNote(`Queued ${res.id}. Execute locally with veriflow run, then --sync.`);
+      setNote(`Queued ${res.id}. A connected device (veriflow device connect) claims and executes it — or run it yourself with veriflow run, then --sync.`);
       markAction("queue_run");
       load();
       router.push(`/runs/${res.id}`);
@@ -86,7 +86,7 @@ export default function RunsPage() {
     >
       <OnboardingChecklist />
       <p className="empty">
-        Queue an objective here (cloud record). The browser harness still runs on the CLI — this does not start Chromium from the dashboard.
+        Queue an objective here (cloud record). A connected device worker claims queued runs and executes them — start one with `veriflow device connect`.
       </p>
       <label>
         Start URL

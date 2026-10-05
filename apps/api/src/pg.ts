@@ -211,6 +211,8 @@ ALTER TABLE flows ADD COLUMN IF NOT EXISTS retry_policy JSONB;
 ALTER TABLE flows ADD COLUMN IF NOT EXISTS quarantined BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE flows ADD COLUMN IF NOT EXISTS version INTEGER NOT NULL DEFAULT 1;
 ALTER TABLE flows ADD COLUMN IF NOT EXISTS routes JSONB;
+ALTER TABLE device_jobs ADD COLUMN IF NOT EXISTS run_id TEXT;
+ALTER TABLE device_jobs ADD COLUMN IF NOT EXISTS flow_id TEXT;
 CREATE TABLE IF NOT EXISTS devices (
   id TEXT PRIMARY KEY,
   project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -260,6 +262,8 @@ function mapDeviceJob(r: pg.QueryResultRow): DeviceJobRow {
     claimedBy: r.claimed_by ?? undefined,
     claimedAt: r.claimed_at ?? undefined,
     resultRunId: r.result_run_id ?? undefined,
+    runId: r.run_id ?? undefined,
+    flowId: r.flow_id ?? undefined,
     createdAt: r.created_at,
   };
 }
@@ -1057,8 +1061,8 @@ export class PgStore implements CloudStore {
   }
   async queueDeviceJob(row: DeviceJobRow): Promise<DeviceJobRow> {
     await this.pool.query(
-      `INSERT INTO device_jobs (id, project_id, objective, env_url, status, created_at) VALUES ($1,$2,$3,$4,$5,$6)`,
-      [row.id, row.projectId, row.objective, row.envUrl ?? null, row.status, row.createdAt],
+      `INSERT INTO device_jobs (id, project_id, objective, env_url, status, run_id, flow_id, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+      [row.id, row.projectId, row.objective, row.envUrl ?? null, row.status, row.runId ?? null, row.flowId ?? null, row.createdAt],
     );
     return row;
   }
@@ -1076,7 +1080,24 @@ export class PgStore implements CloudStore {
        RETURNING *`,
       [device.projectId, deviceId, new Date().toISOString()],
     );
-    return res.rows[0] ? mapDeviceJob(res.rows[0]) : undefined;
+    if (res.rows[0]) return mapDeviceJob(res.rows[0]);
+    // Fallback: claim the oldest queued cloud run as a device job so
+    // dashboard-queued runs are executable by connected devices too. The
+    // subquery + guarded UPDATE make the claim atomic across replicas.
+    const runRes = await this.pool.query(
+      `UPDATE runs SET status='running'
+       WHERE id = (SELECT id FROM runs WHERE project_id=$1 AND status='queued' ORDER BY started_at LIMIT 1)
+       RETURNING id, flow_id, objective, env_url`,
+      [device.projectId],
+    );
+    const run = runRes.rows[0];
+    if (!run) return undefined;
+    const jobRes = await this.pool.query(
+      `INSERT INTO device_jobs (id, project_id, objective, env_url, status, claimed_by, claimed_at, run_id, flow_id, created_at)
+       VALUES ($1,$2,$3,$4,'claimed',$5,$6,$7,$8,$6) RETURNING *`,
+      [newId("job"), device.projectId, run.objective || "(no objective)", run.env_url ?? null, deviceId, new Date().toISOString(), run.id, run.flow_id ?? null],
+    );
+    return jobRes.rows[0] ? mapDeviceJob(jobRes.rows[0]) : undefined;
   }
   async completeDeviceJob(id: string, resultRunId: string): Promise<DeviceJobRow | undefined> {
     const res = await this.pool.query(

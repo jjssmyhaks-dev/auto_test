@@ -149,3 +149,12 @@ No `.env` required to boot: API defaults to MemoryStore + filesystem blobs (`.ve
 ---
 
 *Veriflow engineering · v0.2 · 18 test files / 84 tests / 11 workspaces, CI green*
+
+## 10. Device cloud closed loop (2026-10-05)
+
+The device-queue promise is now real end to end (see `docs/gap-analysis.md` for the full audit):
+
+- `claimDeviceJob` (Memory + PG, atomic UPDATE in PG) falls back to claiming the oldest **queued cloud run** — dashboard-queued runs are no longer unreachable by workers.
+- Claimed jobs carry `runId` (+ `flowId`); `RunOptions.runId` lets the worker execute under the claimed id so `syncRun` updates the dashboard row in place (queued → running → passed/failed).
+- `veriflow device connect` now: claims → executes with live frame push → `syncRun` (events/spans/evidence) → `POST /v1/device-jobs/:id/complete { runId }`.
+- Verified by `scripts/smoke-device.mjs` (9 checks) and a new unit test covering claim-fallback, running-flip, no-double-claim, in-place sync, and completion.

@@ -935,6 +935,69 @@ describe("Veriflow API", () => {
     expect((devices.body.devices as { status: string }[])[0].status).toBe("online");
   });
 
+  it("device cloud: a queued dashboard run is claimable and the worker syncs it in place", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "vf-devrun-"));
+    const app = createApp({ store: new MemoryStore(), blobs: new FsBlobStore(join(dir, "blobs")) });
+    const signup = await json(app, "/v1/auth/signup", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ email: "devrun@example.com", password: "password1" }),
+    });
+    const auth = { authorization: `Bearer ${signup.body.token as string}`, "content-type": "application/json" };
+    const reg = await json(app, "/v1/devices", { method: "POST", headers: auth, body: JSON.stringify({ name: "worker-2" }) });
+    const deviceId = (reg.body.device as { id: string }).id;
+
+    // The dashboard queues a run (status queued, no events yet).
+    const queued = await json(app, "/v1/runs", {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({ objective: "open example.com and assert the heading", envUrl: "https://example.com", status: "queued", stepCount: 0 }),
+    });
+    const runId = queued.body.id as string;
+
+    // A connected device claims it: the job materializes from the queued run.
+    const claim = await json(app, `/v1/devices/${deviceId}/claim`, { method: "POST", headers: auth, body: "{}" });
+    const job = claim.body.job as { id: string; runId?: string; objective: string };
+    expect(job.runId).toBe(runId);
+    expect(job.objective).toContain("assert the heading");
+
+    // The claimed run flips to running so no other device double-claims it.
+    const mid = await json(app, `/v1/runs/${runId}`, { headers: auth });
+    expect((mid.body.run as { status: string }).status).toBe("running");
+    const emptyClaim = await json(app, `/v1/devices/${deviceId}/claim`, { method: "POST", headers: auth, body: "{}" });
+    expect(emptyClaim.body.job).toBeNull();
+
+    // The worker executes under the same run id: the sync updates the row in
+    // place (queued → passed) instead of creating a second run.
+    const ingest = await json(app, "/v1/runs", {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({
+        id: runId,
+        objective: "open example.com and assert the heading",
+        envUrl: "https://example.com",
+        status: "passed",
+        stepCount: 2,
+        events: [
+          { type: "run_start", ts: new Date().toISOString(), payload: { objective: "x", envUrl: "https://example.com" } },
+          { type: "decide", ts: new Date().toISOString(), payload: { action: { type: "open", url: "https://example.com" } } },
+          { type: "run_end", ts: new Date().toISOString(), payload: { status: "passed", steps: 2 } },
+        ],
+      }),
+    });
+    expect(ingest.status).toBe(200);
+    const finalRun = await json(app, `/v1/runs/${runId}`, { headers: auth });
+    const run = finalRun.body.run as { status: string; stepCount: number };
+    expect(run.status).toBe("passed");
+    expect(run.stepCount).toBe(2);
+
+    // Closing the loop: the job completes with the result run id.
+    const done = await json(app, `/v1/device-jobs/${job.id}/complete`, { method: "POST", headers: auth, body: JSON.stringify({ runId }) });
+    const doneJob = done.body.job as { status: string; resultRunId?: string };
+    expect(doneJob.status).toBe("done");
+    expect(doneJob.resultRunId).toBe(runId);
+  });
+
   it("redteam endpoint ingests a probe run (safe stub => green)", async () => {
     const stub = createServer((req, res) => {
       let body = "";
