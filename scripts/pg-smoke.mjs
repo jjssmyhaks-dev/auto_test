@@ -94,8 +94,9 @@ try {
 
   const bus = new PgLiveBus(store.pool);
   const frame = { stepIndex: 1, url: "https://example.com", png: Buffer.from("png-bytes"), at: new Date().toISOString() };
-  await bus.pushFrame(`run_ci_${Date.now()}`, frame);
-  const frames = await bus.recentFrames(`run_ci_${Date.now()}`);
+  const frameRunId = `run_ci_${Date.now()}`;
+  await bus.pushFrame(frameRunId, frame);
+  const frames = await bus.recentFrames(frameRunId);
   if (frames.length !== 1 || frames[0].url !== "https://example.com" || frames[0].png.toString() !== "png-bytes") {
     throw new Error("pg live bus frame round-trip failed");
   }
