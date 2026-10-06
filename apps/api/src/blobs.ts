@@ -59,6 +59,22 @@ export class FsBlobStore implements BlobStore {
   }
 }
 
+/**
+ * RFC 3986 encoding for SigV4: percent-encode everything except the
+ * unreserved set [A-Za-z0-9-._~]. encodeURIComponent leaves !'()* alone,
+ * which strict S3 implementations (Garage, real AWS) reject.
+ */
+function encodeRfc3986(s: string): string {
+  // encodeURIComponent also leaves '+' literal; canonical form needs %2B
+  // (a raw '+' re-canonicalizes differently server-side).
+  return encodeURIComponent(s).replace(/[!'()*+]/g, (ch) => `%${ch.charCodeAt(0).toString(16).toUpperCase()}`);
+}
+
+/** Canonical URI: each path segment RFC 3986 encoded, "/" preserved. */
+function encodeUriPath(s: string): string {
+  return s.split("/").map(encodeRfc3986).join("/");
+}
+
 /** Minimal SigV4 PutObject/GetObject for MinIO / S3-compatible APIs. */
 export class S3BlobStore implements BlobStore {
   readonly kind = "s3";
@@ -73,13 +89,14 @@ export class S3BlobStore implements BlobStore {
 
   private url(key: string) {
     const base = this.endpoint.replace(/\/$/, "");
-    return `${base}/${this.bucket}/${key.split("/").map(encodeURIComponent).join("/")}`;
+    return `${base}/${encodeUriPath(`${this.bucket}/${key}`)}`;
   }
 
   async put(key: string, bytes: Buffer, contentType = "application/octet-stream"): Promise<string> {
     try {
-      const url = this.url(key);
-      const headers = this.sign("PUT", `/${this.bucket}/${key}`, bytes, contentType);
+      const canonicalUri = `/${encodeUriPath(`${this.bucket}/${key}`)}`;
+      const url = `${this.endpoint.replace(/\/$/, "")}${canonicalUri}`;
+      const headers = this.sign("PUT", canonicalUri, bytes, contentType);
       const res = await fetch(url, { method: "PUT", headers, body: new Uint8Array(bytes) });
       if (!res.ok) throw new Error(`s3 put ${res.status}`);
       if (this.fallback) await this.fallback.put(key, bytes, contentType);
@@ -100,17 +117,27 @@ export class S3BlobStore implements BlobStore {
     const keys: string[] = [];
     let token: string | undefined;
     do {
-      const params = new URLSearchParams({ "list-type": "2", "max-keys": "1000", prefix });
-      if (token) params.set("continuation-token", token);
+      // Canonical query string: RFC 3986-encoded pairs, sorted by name. Spaces
+      // must be %20 (URLSearchParams would emit '+', which real S3 re-canonicalizes
+      // differently and strict servers reject).
+      const params: Array<[string, string]> = [
+        ["list-type", "2"],
+        ["max-keys", "1000"],
+        ["prefix", prefix],
+      ];
+      if (token) params.push(["continuation-token", token]);
+      const canonicalQuery = params
+        .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+        .map(([k, v]) => `${encodeRfc3986(k)}=${encodeRfc3986(v)}`)
+        .join("&");
       const canonicalUri = `/${this.bucket}`;
-      const url = `${this.endpoint.replace(/\/$/, "")}${canonicalUri}?${params.toString()}`;
-      // SigV4 signs the canonical query string, so build the canonical request by hand.
-      const headers = this.signWithQuery("GET", canonicalUri, params.toString(), Buffer.alloc(0));
+      const url = `${this.endpoint.replace(/\/$/, "")}${canonicalUri}?${canonicalQuery}`;
+      const headers = this.signWithQuery("GET", canonicalUri, canonicalQuery, Buffer.alloc(0));
       const res = await fetch(url, { method: "GET", headers });
       if (!res.ok) throw new Error(`s3 list ${res.status}`);
       const xml = await res.text();
       for (const m of xml.matchAll(/<Key>([^<]+)<\/Key>/g)) {
-        keys.push(m[1].replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&"));
+        keys.push(m[1].replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&amp;/g, "&"));
       }
       token = /<NextContinuationToken>([^<]+)<\/NextContinuationToken>/.exec(xml)?.[1];
     } while (token);
@@ -127,12 +154,15 @@ export class S3BlobStore implements BlobStore {
       let deleted = 0;
       for (let i = 0; i < keys.length; i += 1000) {
         const batch = keys.slice(i, i + 1000);
+        const xmlEscape = (k: string) => k.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&apos;");
         const body = Buffer.from(
-          `<?xml version="1.0" encoding="UTF-8"?><Delete>${batch.map((k) => `<Object><Key>${k.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")}</Key></Object>`).join("")}<Quiet>true</Quiet></Delete>`,
+          `<?xml version="1.0" encoding="UTF-8"?><Delete>${batch.map((k) => `<Object><Key>${xmlEscape(k)}</Key></Object>`).join("")}<Quiet>true</Quiet></Delete>`,
         );
         const canonicalUri = `/${this.bucket}`;
-        const url = `${this.endpoint.replace(/\/$/, "")}${canonicalUri}?delete`;
-        const headers = this.signWithQuery("POST", canonicalUri, "delete", body, "application/xml", true);
+        // SigV4 canonical query appends '=' even for valueless params — real
+        // S3 and Garage canonicalize a bare '?delete' to 'delete='.
+        const url = `${this.endpoint.replace(/\/$/, "")}${canonicalUri}?delete=`;
+        const headers = this.signWithQuery("POST", canonicalUri, "delete=", body, "application/xml", true);
         const res = await fetch(url, { method: "POST", headers, body: new Uint8Array(body) });
         if (!res.ok) throw new Error(`s3 delete ${res.status}`);
         deleted += batch.length;
@@ -152,8 +182,9 @@ export class S3BlobStore implements BlobStore {
 
   async get(key: string): Promise<Buffer | undefined> {
     try {
-      const url = this.url(key);
-      const headers = this.sign("GET", `/${this.bucket}/${key}`, Buffer.alloc(0), "application/octet-stream");
+      const canonicalUri = `/${encodeUriPath(`${this.bucket}/${key}`)}`;
+      const url = `${this.endpoint.replace(/\/$/, "")}${canonicalUri}`;
+      const headers = this.sign("GET", canonicalUri, Buffer.alloc(0), "application/octet-stream");
       const res = await fetch(url, { method: "GET", headers });
       if (!res.ok) return this.fallback?.get(key);
       return Buffer.from(await res.arrayBuffer());

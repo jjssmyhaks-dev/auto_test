@@ -41,10 +41,10 @@ Updated: 2026-10-05 (second pass). Everything below is verified against the code
 ### 🟢 Competitive parity / growth
 
 9. **SCIM/SAML** directory sync + SSO groups (OIDC SSO exists; SCIM provisioning does not).
-10. **Python SDK** (`@veriflow/sdk` is TypeScript; agents in Python must use raw REST).
+10. ~~**Python SDK**~~ **CLOSED 2026-10-06**: `sdks/python` ships a zero-dependency, typed client (submit runs, sync results, read traces, device jobs, recipes) with unit + live tests and a CI leg.
 11. **Docs site**: single-page `/docs/api` + `/docs/mcp`; no versioning, search, or hosted docs. README covers install; no public quickstart video/GIF.
 12. **i18n**: dashboard is English-only.
-13. **Real S3 dialect validation**: `S3BlobStore` list/delete math is verified against a fake S3; run once against real MinIO/R2/AWS before shipping that path to customers.
+13. ~~**Real S3 dialect validation**~~ **CLOSED 2026-10-06**: validated against a real, independent S3 implementation (Garage, since MinIO community editions are discontinued/unpullable) via `scripts/smoke-s3.mjs` — 11/11 including paginated list (2400 keys), paginated delete, special-char keys. Two real dialect gaps found and fixed: valueless query params sign as `delete=`, and canonical URI/query now RFC 3986-encode (spaces, `+`, unicode).
 14. **Mobile device emulation**: viewport action exists; no device profiles (iPhone/Pixel presets) or touch emulation.
 
 ## What already is real (audited, not dummy)

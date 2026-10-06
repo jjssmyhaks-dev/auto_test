@@ -21,6 +21,7 @@ import {
 import { computeAlerts, MemoryStore, monthStartIso, QUOTAS, type CloudStore } from "./store.js";
 import { sharedLiveBus, type LiveBus } from "./live.js";
 import { fanOutWebhooks } from "./webhooks.js";
+import { reconcileStripeBilling } from "./billing.js";
 import { githubActionsWorkflow } from "./workflow.js";
 import type { BlobStore } from "./blobs.js";
 import { deliver, deliverResultSummary, parseChannel } from "./deliver.js";
@@ -35,6 +36,8 @@ export interface AppDeps {
   /** Auth rate limiter backend. Default: in-memory; pass PgRateLimiter for
    *  multi-replica deployments. */
   rateLimiter?: RateLimiter;
+  /** Injectable Stripe HTTP for tests. Default: global fetch. */
+  stripeFetch?: typeof fetch;
 }
 
 // ---- Run ingest trust boundaries (POST /v1/runs) ----
@@ -323,6 +326,7 @@ export function createApp(deps?: Partial<AppDeps>) {
         "/v1/device-jobs": { get: {}, post: {} },
         "/v1/device-jobs/{id}/complete": { post: {} },
         "/v1/billing/stripe-webhook": { post: {} },
+        "/v1/billing/reconcile": { post: {} },
         "/v1/redteam": { post: {} },
         "/v1/compare": { get: {} },
         "/v1/usage": { get: {} },
@@ -1706,6 +1710,33 @@ export function createApp(deps?: Partial<AppDeps>) {
     }
     const user = await store.setTier(userId, tier);
     return c.json({ received: true, tier: user?.tier });
+  });
+
+  // Stripe reconciliation: self-heal for a missed webhook. Webhook delivery is
+  // best-effort — if Stripe never reached us, the user paid but the tier never
+  // flipped. Admins sweep the whole window; anyone else can only heal their
+  // own tier. Never downgrades (see billing.ts).
+  app.post("/v1/billing/reconcile", async (c) => {
+    const { ctx, error } = await requireAuth(c);
+    if (!ctx) return error;
+    const body = (await c.req.json().catch(() => ({}))) as { windowHours?: number };
+    const windowHours = Math.min(Math.max(Math.round(Number(body.windowHours) || 168), 1), 720);
+    let onlyUserId: string | undefined = ctx.user.id;
+    const project = await resolveProject(ctx);
+    if (project) {
+      const denied = await requireRole(c, project.id, "admin");
+      if (!denied) onlyUserId = undefined; // admins sweep every user in the window
+    }
+    try {
+      const report = await reconcileStripeBilling(store, {
+        fetchImpl: deps?.stripeFetch ?? fetch,
+        windowHours,
+        onlyUserId,
+      });
+      return c.json(report);
+    } catch (err) {
+      return c.json({ error: err instanceof Error ? err.message : "reconcile failed" }, 502);
+    }
   });
 
   // Hosted device cloud: register, heartbeat, queue work, claim (FIFO).

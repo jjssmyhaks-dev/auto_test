@@ -14,3 +14,7 @@ playwright-report
 test-results
 .veriflow-data
 .freebuff/
+sdks/python/.venv/
+sdks/python/**/__pycache__/
+sdks/python/*.egg-info/
+sdks/python/dist/

@@ -1,0 +1,121 @@
+name: Nightly
+
+on:
+  schedule:
+    # 03:07 UTC daily (off the hour to avoid CI-window congestion)
+    - cron: "7 3 * * *"
+  workflow_dispatch: {} # run on demand from the Actions tab
+
+jobs:
+  keyless-recipe-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 9.15.0
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Playwright Chromium
+        run: pnpm playwright:install chromium
+
+      - name: Build packages + API + CLI
+        run: |
+          pnpm --filter "./packages/*" build
+          pnpm --filter @veriflow/api build
+          pnpm --filter @veriflow/cli build
+
+      - name: Boot the API and the local test site
+        run: |
+          node scripts/test-site.mjs 8099 &
+          echo $! > /tmp/test-site.pid
+          cd apps/api && node dist/index.js &
+          echo $! > /tmp/veriflow-api.pid
+
+      - name: Wait for /health and the test site
+        run: |
+          code=000
+          for i in $(seq 1 30); do
+            code=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8787/health || true)
+            [ "$code" = "200" ] && break
+            sleep 1
+          done
+          echo "health status: $code"
+          test "$code" = "200"
+          test "$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8099/)" = "200"
+
+      # The full keyless loop a dashboard user gets: flow + synthetic passing
+      # run → derived recipe → mode=recipe device job → the real
+      # `veriflow device connect` worker replays it in real Chromium → result
+      # run synced to the cloud. No LLM keys anywhere in this job.
+      - name: Keyless recipe e2e (positive leg)
+        working-directory: apps/cli
+        run: |
+          set -e
+          EMAIL="nightly-pos-$(date +%s)@example.com"
+          SEED=$(node ../../scripts/nightly-seed.mjs http://127.0.0.1:8787 "$EMAIL" http://127.0.0.1:8099/)
+          TOKEN() { node -e 'console.log(JSON.parse(process.argv[1]).token)' "$SEED"; }
+          curl -sf -X POST http://127.0.0.1:8787/v1/device-jobs \
+            -H "authorization: Bearer $(TOKEN)" -H 'content-type: application/json' \
+            -d "{\"flowId\":\"$(node -e 'console.log(JSON.parse(process.argv[1]).flowId)' "$SEED")\",\"objective\":\"nightly recipe\",\"mode\":\"recipe\"}" > /tmp/job.json
+          JOB_ID=$(node -e 'console.log(JSON.parse(require("fs").readFileSync("/tmp/job.json","utf8")).job.id)')
+          node dist/index.js login --api-url http://127.0.0.1:8787 --email "$EMAIL" --password password1
+          ST=""
+          for i in $(seq 1 8); do
+            timeout --signal=INT 25 node dist/index.js device connect --name nightly-worker --poll 2000 || true
+            ST=$(curl -sf "http://127.0.0.1:8787/v1/device-jobs" -H "authorization: Bearer $(TOKEN)" \
+              | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const j=JSON.parse(s).jobs.find(j=>j.id===process.argv[1]);console.log(j?j.status:"missing")})' "$JOB_ID")
+            echo "job status: $ST"
+            [ "$ST" = "done" ] && break
+            [ "$ST" = "failed" ] && { echo "recipe job failed"; exit 1; }
+          done
+          [ "$ST" = "done" ] || { echo "worker never completed the job"; exit 1; }
+          RUN=$(curl -sf "http://127.0.0.1:8787/v1/runs?limit=50" -H "authorization: Bearer $(TOKEN)" \
+            | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const r=JSON.parse(s).runs.find(r=>r.objective==="nightly recipe");console.log(r?r.status:"missing")})')
+          echo "positive run status: $RUN"
+          [ "$RUN" = "passed" ] || { echo "positive leg did not pass"; exit 1; }
+          echo "positive leg ok"
+
+      # Negative leg: same recipe shape against a page whose heading differs —
+      # a stale recipe must produce a FAILED run, never a silent success.
+      - name: Keyless recipe e2e (negative leg)
+        working-directory: apps/cli
+        run: |
+          set -e
+          EMAIL="nightly-neg-$(date +%s)@example.com"
+          SEED=$(node ../../scripts/nightly-seed.mjs http://127.0.0.1:8787 "$EMAIL" http://127.0.0.1:8099/other)
+          TOKEN() { node -e 'console.log(JSON.parse(process.argv[1]).token)' "$SEED"; }
+          curl -sf -X POST http://127.0.0.1:8787/v1/device-jobs \
+            -H "authorization: Bearer $(TOKEN)" -H 'content-type: application/json' \
+            -d "{\"flowId\":\"$(node -e 'console.log(JSON.parse(process.argv[1]).flowId)' "$SEED")\",\"objective\":\"nightly negative\",\"mode\":\"recipe\"}" > /tmp/job2.json
+          JOB_ID=$(node -e 'console.log(JSON.parse(require("fs").readFileSync("/tmp/job2.json","utf8")).job.id)')
+          node dist/index.js login --api-url http://127.0.0.1:8787 --email "$EMAIL" --password password1
+          ST=""
+          for i in $(seq 1 8); do
+            timeout --signal=INT 25 node dist/index.js device connect --name nightly-worker --poll 2000 || true
+            ST=$(curl -sf "http://127.0.0.1:8787/v1/device-jobs" -H "authorization: Bearer $(TOKEN)" \
+              | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const j=JSON.parse(s).jobs.find(j=>j.id===process.argv[1]);console.log(j?j.status:"missing")})' "$JOB_ID")
+            [ "$ST" = "done" ] && break
+          done
+          [ "$ST" = "done" ] || { echo "worker never completed the job"; exit 1; }
+          RUN=$(curl -sf "http://127.0.0.1:8787/v1/runs?limit=50" -H "authorization: Bearer $(TOKEN)" \
+            | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const r=JSON.parse(s).runs.find(r=>r.objective==="nightly negative");console.log(r?r.status:"missing")})')
+          echo "negative run status: $RUN"
+          [ "$RUN" = "failed" ] || { echo "negative leg did not fail as expected"; exit 1; }
+          echo "negative leg ok"
+
+      - name: Stop API and test site
+        if: always()
+        run: |
+          for f in /tmp/veriflow-api.pid /tmp/test-site.pid; do
+            if [ -f "$f" ]; then kill "$(cat "$f")" || true; fi
+          done

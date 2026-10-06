@@ -31,7 +31,9 @@ describe("S3BlobStore deleteByPrefix", () => {
           res.end(xml);
           return;
         }
-        if (req.method === "POST" && url.endsWith("?delete")) {
+        // Real S3 (and Garage) canonicalize the valueless param as "delete=";
+        // the wire form matches the signed canonical query.
+        if (req.method === "POST" && url.endsWith("?delete=")) {
           for (const m of body.toString("utf8").matchAll(/<Key>([^<]+)<\/Key>/g)) {
             stored.delete(m[1]);
           }
@@ -75,9 +77,9 @@ describe("S3BlobStore deleteByPrefix", () => {
     const list = seen.find((s) => s.method === "GET");
     expect(list?.url).toContain("list-type=2");
     expect(list?.url).toContain("prefix=run_a%2F");
-    // The delete used POST ?delete with an XML body naming the keys.
+    // The delete used POST ?delete= with an XML body naming the keys.
     const del = seen.find((s) => s.method === "POST");
-    expect(del?.url.endsWith("?delete")).toBe(true);
+    expect(del?.url.endsWith("?delete=")).toBe(true);
     expect(del?.body).toContain("<Key>run_a/video.webm</Key>");
   });
 

@@ -1,0 +1,26 @@
+# Garage (open-source S3-compatible server) config used by
+# scripts/smoke-s3.mjs to validate the S3BlobStore SigV4 dialect against a
+# real, independent S3 implementation. Test-only credentials — never prod.
+metadata_dir = "/var/lib/garage/meta"
+data_dir = "/var/lib/garage/data"
+
+db_engine = "lmdb"
+replication_factor = 1
+
+rpc_bind_addr = "[::]:3901"
+rpc_public_addr = "127.0.0.1:3901"
+rpc_secret = "1eed8b5b1e2ac7f2b3b3ec5e1f0a9d7c6f5e4d3c2b1a0987654321fedcba9876"
+
+[s3_api]
+s3_region = "us-east-1"
+api_bind_addr = "[::]:3900"
+root_domain = ".s3.garage.localhost"
+
+[s3_web]
+bind_addr = "[::]:3902"
+root_domain = ".web.garage.localhost"
+index = "index.html"
+
+[admin]
+api_bind_addr = "[::]:3903"
+admin_token = "veriflow-test-admin"

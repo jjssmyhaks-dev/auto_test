@@ -1174,6 +1174,80 @@ describe("Veriflow API", () => {
     expect(sim.body.status).toBe("upgraded");
   });
 
+  it("billing reconcile heals a missed webhook without ever downgrading", async () => {
+    delete process.env.STRIPE_WEBHOOK_SECRET; // force the simulated-upgrade path for setup
+    process.env.STRIPE_SECRET_KEY = "sk_test_fake";
+    const store = new MemoryStore();
+    const app = createApp({
+      store,
+      blobs: new FsBlobStore(join(tmpdir(), "vf-reconcile")),
+      // Fake Stripe API: one paid completed session for this user, team tier.
+      stripeFetch: (async (url: RequestInfo | URL) => {
+        const urlStr = String(url);
+        if (!urlStr.startsWith("https://api.stripe.com/v1/checkout/sessions")) throw new Error(`unexpected fetch ${urlStr}`);
+        return new Response(
+          JSON.stringify({
+            data: [
+              { id: "cs_paid", status: "complete", payment_status: "paid", metadata: { userId: "u_heal", tier: "team" } },
+              { id: "cs_already", status: "complete", payment_status: "paid", metadata: { userId: "u_team", tier: "team" } },
+              { id: "cs_lower", status: "complete", payment_status: "paid", metadata: { userId: "u_team", tier: "free" } },
+              { id: "cs_unpaid", status: "complete", payment_status: "unpaid", metadata: { userId: "u_heal", tier: "team" } },
+            ],
+          }),
+          { status: 200 },
+        );
+      }) as typeof fetch,
+    });
+    const signup = await json(app, "/v1/auth/signup", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ email: "recon@example.com", password: "password1" }),
+    });
+    const token = signup.body.token as string;
+    const known = (await store.getUser(signup.body.user.id as string))!;
+    // Non-admin self-service reconcile: scoped to the caller's user id, and the
+    // fake session metadata points at other users → nothing heals here.
+    const recon = await json(app, "/v1/billing/reconcile", {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({ windowHours: 24 }),
+    });
+    expect(recon.status).toBe(200);
+    expect(recon.body.checked).toBe(3); // the unpaid session is filtered out
+    expect(recon.body.healed).toEqual([]);
+
+    // The reconciler function itself, called directly, heals and never downgrades.
+    const { reconcileStripeBilling } = await import("./billing.js");
+    const report = await reconcileStripeBilling(store, {
+      fetchImpl: (async () =>
+        new Response(
+          JSON.stringify({
+            data: [
+              { id: "cs_a", status: "complete", payment_status: "paid", metadata: { userId: known.id, tier: "team" } },
+            ],
+          }),
+          { status: 200 },
+        )) as typeof fetch,
+      windowHours: 24,
+    });
+    expect(report.healed).toEqual([{ userId: known.id, tier: "team" }]);
+    expect(((await store.getUser(known.id))?.tier) ?? "").toBe("team");
+    // Re-running must not downgrade team → anything else.
+    const again = await reconcileStripeBilling(store, {
+      fetchImpl: (async () =>
+        new Response(JSON.stringify({ data: [{ id: "cs_a", status: "complete", payment_status: "paid", metadata: { userId: known.id, tier: "starter" } }] }), { status: 200 })) as typeof fetch,
+      windowHours: 24,
+    });
+    expect(again.healed).toEqual([]);
+    expect(((await store.getUser(known.id))?.tier) ?? "").toBe("team");
+
+    // Without STRIPE_SECRET_KEY the reconciler is a no-op.
+    delete process.env.STRIPE_SECRET_KEY;
+    const noop = await reconcileStripeBilling(store, { windowHours: 24 });
+    expect(noop.skipped).toBe("stripe not configured");
+    delete process.env.STRIPE_SECRET_KEY;
+  });
+
   it("workspace layer: create, invite, cross-project roles, attach, usage rollup", async () => {
     const app = createApp({ store: new MemoryStore(), blobs: new FsBlobStore(join(tmpdir(), "vf-ws")) });
     const signup = async (email: string) => {
